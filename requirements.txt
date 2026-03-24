@@ -1,0 +1,6 @@
+mlx-whisper
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+sounddevice
+soundfile
+numpy
