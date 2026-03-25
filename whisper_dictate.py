@@ -64,7 +64,9 @@ from AppKit import NSEvent, NSFlagsChangedMask
 from Foundation import NSData
 from Quartz import (
     CGEventGetFlags,
+    CGEventSourceFlagsState,
     kCGEventFlagsChanged,
+    kCGEventSourceStateHIDSystemState,
     kCGEventTapDisabledByTimeout,
     kCGEventTapDisabledByUserInput,
     kCGEventTapOptionListenOnly,
@@ -96,6 +98,8 @@ MEMORY_MAINTENANCE_INTERVAL_SEC = 2 * 60 * 60  # 2h (was 24h)
 FN_MIN_HOLD_SEC = 0.2  # minimum FN hold to filter ghost events
 ASR_SLOW_THRESHOLD_SEC = 10.0
 ASR_SLOW_RTF_THRESHOLD = 1.8
+ASR_WATCHDOG_SEC = 30.0           # max time for transcription before watchdog resets
+RECORDING_TIMEOUT_SEC = 120.0     # max recording duration (auto-stop if FN release missed)
 ASR_SLOW_STREAK_TRIGGER = 1
 PROMPT_DISABLE_ROUNDS_ON_SLOW = 6
 KEYWORDS_MAX_CHARS = 900
@@ -154,6 +158,19 @@ def _strip_hallucinations(text: str) -> str:
 def _strip_tail_noise(text: str) -> str:
     """Drop known recurring tail-noise token from ASR output."""
     return _TAIL_NOISE_RE.sub('', text).strip()
+
+
+_TERMINAL_VOLATILE_RE_DIM = re.compile(r'\s+—\s+\d+×\d+$')
+_TERMINAL_VOLATILE_RE_PROC = re.compile(r'\s+—\s+\S+\s+◂\s+\S+$')
+
+
+def _normalize_window_title(title: str) -> str:
+    """Strip volatile terminal title parts (subprocess name, dimensions) for stable comparison."""
+    if not title:
+        return title
+    title = _TERMINAL_VOLATILE_RE_DIM.sub('', title)
+    title = _TERMINAL_VOLATILE_RE_PROC.sub('', title)
+    return title
 
 
 def _trim_trailing_silence(audio: np.ndarray) -> tuple[np.ndarray, float]:
@@ -657,6 +674,8 @@ class AppDelegate(NSObject):
         self._slow_asr_streak = 0
         self._disable_prompt_rounds = 0
         self._fn_press_time = 0.0
+        self._asr_watchdog = None
+        self._recording_timeout = None
         return self
 
     def applicationDidFinishLaunching_(self, notification):
@@ -990,6 +1009,19 @@ class AppDelegate(NSObject):
             if event_type in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
                 CGEventTapEnable(proxy, True)
                 print("[whisper_dictate] Event tap re-enabled.")
+                try:
+                    cur = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState)
+                    fn_actual = bool(cur & FN_FLAG)
+                    if self._fn_held and not fn_actual:
+                        print("[whisper_dictate] FN sync: was held but now released, triggering release")
+                        self._fn_held = False
+                        AppHelper.callAfter(self._on_fn_release)
+                    elif not self._fn_held and fn_actual:
+                        print("[whisper_dictate] FN sync: now held, triggering press")
+                        self._fn_held = True
+                        AppHelper.callAfter(self._on_fn_press)
+                except Exception as e:
+                    print(f"[whisper_dictate] FN sync error: {e}")
                 return event
 
             flags = CGEventGetFlags(event)
@@ -1101,11 +1133,30 @@ class AppDelegate(NSObject):
         self.stream.start()
         print("[whisper_dictate] Recording...")
 
+        if self._recording_timeout:
+            self._recording_timeout.cancel()
+
+        def _force_stop_recording():
+            if self.is_recording:
+                print(f"[whisper_dictate] WATCHDOG: recording timeout ({RECORDING_TIMEOUT_SEC}s), forcing stop")
+                def release_on_main():
+                    self._fn_held = False
+                    self._on_fn_release()
+                AppHelper.callAfter(release_on_main)
+
+        self._recording_timeout = threading.Timer(RECORDING_TIMEOUT_SEC, _force_stop_recording)
+        self._recording_timeout.daemon = True
+        self._recording_timeout.start()
+
     def _on_fn_release(self):
         if not self.is_recording:
             return
         self.is_recording = False
         hold_duration = time.monotonic() - self._fn_press_time
+
+        if self._recording_timeout:
+            self._recording_timeout.cancel()
+            self._recording_timeout = None
 
         # Move stream ref off self — background thread will stop/close it
         stream_ref = self.stream
@@ -1130,6 +1181,20 @@ class AppDelegate(NSObject):
         self._resize_indicator(INDICATOR_WIDTH_NORMAL)
         self.label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(10.5, 0.25))
         self._update_indicator(TRANSCRIBING_LABEL, 0.17, 0.17, 0.17, 0.52)
+
+        if self._asr_watchdog:
+            self._asr_watchdog.cancel()
+
+        def _asr_timeout():
+            if self.is_transcribing:
+                print(f"[whisper_dictate] WATCHDOG: ASR timeout ({ASR_WATCHDOG_SEC}s), resetting")
+                self.is_transcribing = False
+                self._update_indicator(IDLE_LABEL, 0.17, 0.17, 0.17, 0.52)
+
+        self._asr_watchdog = threading.Timer(ASR_WATCHDOG_SEC, _asr_timeout)
+        self._asr_watchdog.daemon = True
+        self._asr_watchdog.start()
+
         threading.Thread(target=self._transcribe, args=(stream_ref,), daemon=True).start()
 
     def _transcribe(self, stream_ref=None):
@@ -1235,7 +1300,8 @@ class AppDelegate(NSObject):
                 window_title_changed = (
                     bool(self._recording_front_window)
                     and bool(current_front_window)
-                    and current_front_window != self._recording_front_window
+                    and _normalize_window_title(current_front_window)
+                    != _normalize_window_title(self._recording_front_window)
                 )
 
                 if same_app and not window_title_changed:
@@ -1271,6 +1337,9 @@ class AppDelegate(NSObject):
         except Exception as e:
             print(f"[whisper_dictate] Error: {e}")
         finally:
+            if self._asr_watchdog:
+                self._asr_watchdog.cancel()
+                self._asr_watchdog = None
             if tmp and os.path.exists(tmp):
                 try:
                     os.unlink(tmp)
