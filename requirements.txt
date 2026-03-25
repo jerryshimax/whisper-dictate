@@ -1,4 +1,7 @@
 mlx-whisper
+funasr
+torch
+torchaudio
 pyobjc-framework-Cocoa
 pyobjc-framework-Quartz
 sounddevice

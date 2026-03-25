@@ -83,16 +83,38 @@ from Quartz import (
 from CoreFoundation import CFRunLoopGetMain
 from PyObjCTools import AppHelper
 
+# Core Animation (for waveform visualization)
+import ctypes as _ctypes
+_ca_lib = _ctypes.cdll.LoadLibrary('/System/Library/Frameworks/QuartzCore.framework/QuartzCore')
+_ca_lib.CACurrentMediaTime.restype = _ctypes.c_double
+
+import objc as _objc_loader
+_QuartzCore = _objc_loader.loadBundle(
+    'QuartzCore', globals(),
+    '/System/Library/Frameworks/QuartzCore.framework',
+)
+# Now CALayer, CATransaction, CABasicAnimation are in global scope
+from Quartz import CGColorCreateGenericRGB
+
 # ── constants ──────────────────────────────────────────────
 KEYWORDS_FILE = os.path.expanduser("~/.config/whisper/keywords.txt")
 HISTORY_FILE = os.path.expanduser("~/.config/whisper/history.jsonl")
 CONFIG_FILE = os.path.expanduser("~/.config/whisper/config.json")
 LOG_FILE = os.path.expanduser("~/.config/whisper/app.log")
-MODEL = "mlx-community/whisper-large-v3-turbo"
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+ASR_BACKEND = "whisper"  # "whisper" or "paraformer" (togglable via right-click menu)
+PARAFORMER_MODEL = "paraformer-zh"
+PARAFORMER_VAD = "fsmn-vad"
+PARAFORMER_PUNC = "ct-punc"
+_funasr_model = None  # lazy-loaded singleton
 SAMPLE_RATE = 16000
 FN_FLAG = 1 << 23  # NSEventModifierFlagFunction
+# Custom hotkey: Control + Option (both must be held)
+CTRL_FLAG = 1 << 18   # NSEventModifierFlagControl
+OPT_FLAG  = 1 << 19   # NSEventModifierFlagOption
+USE_CTRL_OPT = True   # Set False to revert to FN-only
 HISTORY_RETENTION_DAYS = 7
-CLIPBOARD_RESTORE_DELAY_SEC = 0.35
+CLIPBOARD_RESTORE_DELAY_SEC = 0.15
 MEMORY_SOFT_LIMIT_MB = 2500
 MEMORY_MAINTENANCE_INTERVAL_SEC = 2 * 60 * 60  # 2h (was 24h)
 FN_MIN_HOLD_SEC = 0.2  # minimum FN hold to filter ghost events
@@ -110,25 +132,32 @@ TRAILING_SILENCE_DB_THRESHOLD = -42.0
 
 # indicator appearance
 INDICATOR_WIDTH_NORMAL = 170
-INDICATOR_WIDTH_RECORDING = 170
+INDICATOR_WIDTH_RECORDING = 200
 INDICATOR_WIDTH_RESULT = 170
 INDICATOR_WIDTH_COPY = 240
 INDICATOR_HEIGHT = 20
-INDICATOR_HEIGHT_RECORDING = 20
+INDICATOR_HEIGHT_RECORDING = 26
 INDICATOR_HEIGHT_COPY = 26
-INDICATOR_BOTTOM_MARGIN = 40
+INDICATOR_BOTTOM_MARGIN = 65
 INDICATOR_CORNER_RADIUS = 12
 RESULT_DISPLAY_SECONDS = 5
-METER_UPDATE_INTERVAL_SEC = 0.12
+METER_UPDATE_INTERVAL_SEC = 0.06  # ~16fps for smooth waveform
 METER_MIN_DB = -55.0
 METER_MAX_DB = 0.0
-METER_LINE_WIDTH = 14
 METER_EMA_ALPHA = 0.22
-IDLE_LABEL = f"◦ {'─' * METER_LINE_WIDTH}"
-TRANSCRIBING_LABEL = f"✎ {'┄' * METER_LINE_WIDTH}"
-LOADING_LABEL = f"· {'┄' * METER_LINE_WIDTH}"
-DONE_LABEL = f"✓ {'─' * METER_LINE_WIDTH}"
+IDLE_LABEL = "◦  dictate"
+TRANSCRIBING_LABEL = "✎  ···"
+LOADING_LABEL = "◦  loading"
+DONE_LABEL = "✓  done"
 COPY_READY_LABEL = "✓ Ready to Copy"
+
+# waveform bars
+WAVEFORM_NUM_BARS = 28
+WAVEFORM_BAR_WIDTH = 3.0
+WAVEFORM_BAR_GAP = 1.5
+WAVEFORM_BAR_MIN_H = 2.0
+WAVEFORM_BAR_MAX_H = 18.0
+WAVEFORM_BAR_RADIUS = 1.5
 
 
 # ── post-processing ───────────────────────────────────────
@@ -364,7 +393,7 @@ def postprocess_fast(text: str) -> str:
 
 # ── history ────────────────────────────────────────────────
 def save_history(raw: str, processed: str, duration: float) -> None:
-    os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+    _ensure_private_dir(HISTORY_FILE)
     entry = {
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
         "raw": raw,
@@ -373,6 +402,7 @@ def save_history(raw: str, processed: str, duration: float) -> None:
     }
     with open(HISTORY_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _set_private(HISTORY_FILE)
 
 
 def cleanup_history() -> None:
@@ -426,9 +456,10 @@ def _load_config() -> dict:
 
 
 def _save_config(cfg: dict) -> None:
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    _ensure_private_dir(CONFIG_FILE)
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+    _set_private(CONFIG_FILE)
 
 
 def _get_input_devices() -> list[dict]:
@@ -592,17 +623,267 @@ def run_memory_maintenance() -> None:
         pass
 
 
-def warmup_model() -> None:
-    import mlx_whisper
+LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+LOG_BACKUP_COUNT = 1
 
+
+def _ensure_private_dir(path: str) -> None:
+    """Create directory with 0o700 permissions if it doesn't exist."""
+    d = os.path.dirname(path)
+    if not os.path.exists(d):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    else:
+        os.chmod(d, 0o700)
+
+
+def _set_private(path: str) -> None:
+    """Set file to owner-only read/write (0o600)."""
+    if os.path.exists(path):
+        os.chmod(path, 0o600)
+
+
+def _rotate_log_if_needed() -> None:
+    """Simple log rotation: if log exceeds max size, rotate to .1 and truncate."""
+    if not os.path.exists(LOG_FILE):
+        return
+    try:
+        if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            backup = LOG_FILE + ".1"
+            if os.path.exists(backup):
+                os.unlink(backup)
+            os.rename(LOG_FILE, backup)
+            _set_private(backup)
+    except Exception:
+        pass
+
+
+def _secure_tmpfile(suffix=".wav") -> str:
+    """Create a temp file with restrictive permissions, return its path."""
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    return path
+
+
+def _get_funasr_model():
+    global _funasr_model
+    if _funasr_model is None:
+        from funasr import AutoModel
+        _funasr_model = AutoModel(
+            model=PARAFORMER_MODEL,
+            vad_model=PARAFORMER_VAD,
+            punc_model=PARAFORMER_PUNC,
+        )
+        print(f"[whisper_dictate] FunASR Paraformer loaded ({PARAFORMER_MODEL})")
+    return _funasr_model
+
+
+def warmup_model() -> None:
     silence = np.zeros(SAMPLE_RATE, dtype=np.float32)
-    tmp = tempfile.mktemp(suffix=".wav")
+    tmp = _secure_tmpfile()
     sf.write(tmp, silence, SAMPLE_RATE)
     try:
-        mlx_whisper.transcribe(tmp, path_or_hf_repo=MODEL)
+        if ASR_BACKEND == "paraformer":
+            m = _get_funasr_model()
+            m.generate(input=tmp)
+        else:
+            import mlx_whisper
+            mlx_whisper.transcribe(tmp, path_or_hf_repo=WHISPER_MODEL)
     except Exception:
         pass
     os.unlink(tmp)
+
+
+# ── waveform view ─────────────────────────────────────────
+class WaveformView(NSView):
+    """Layer-backed view with animated waveform bars using Core Animation."""
+
+    _bars = None
+    _levels = None
+    _state = "idle"
+    _shimmer_timer = None
+
+    def initWithFrame_(self, frame):
+        self = objc.super(WaveformView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self.setWantsLayer_(True)
+        self.layer().setMasksToBounds_(True)
+        self._bars = []
+        self._levels = [0.0] * WAVEFORM_NUM_BARS
+        self._state = "idle"
+        self._create_bars()
+        self.setHidden_(True)
+        return self
+
+    def _create_bars(self):
+        total_w = WAVEFORM_NUM_BARS * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP) - WAVEFORM_BAR_GAP
+        bounds = self.bounds()
+        start_x = (bounds.size.width - total_w) / 2.0
+        center_y = bounds.size.height / 2.0
+
+        for i in range(WAVEFORM_NUM_BARS):
+            bar = CALayer.alloc().init()
+            x = start_x + i * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP)
+            h = WAVEFORM_BAR_MIN_H
+            y = center_y - h / 2.0
+            bar.setFrame_(((x, y), (WAVEFORM_BAR_WIDTH, h)))
+            bar.setCornerRadius_(WAVEFORM_BAR_RADIUS)
+            bar.setBackgroundColor_(CGColorCreateGenericRGB(1.0, 1.0, 1.0, 0.15))
+            self.layer().addSublayer_(bar)
+            self._bars.append(bar)
+
+    def relayout(self):
+        """Recalculate bar positions after resize."""
+        total_w = WAVEFORM_NUM_BARS * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP) - WAVEFORM_BAR_GAP
+        bounds = self.bounds()
+        start_x = (bounds.size.width - total_w) / 2.0
+        center_y = bounds.size.height / 2.0
+        CATransaction.begin()
+        CATransaction.setDisableActions_(True)
+        for i, bar in enumerate(self._bars):
+            x = start_x + i * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP)
+            h = WAVEFORM_BAR_MIN_H
+            y = center_y - h / 2.0
+            bar.setFrame_(((x, y), (WAVEFORM_BAR_WIDTH, h)))
+        CATransaction.commit()
+
+    def set_state(self, state):
+        """Transition to: 'idle', 'recording', 'transcribing', 'done'."""
+        old = self._state
+        self._state = state
+        if self._shimmer_timer:
+            self._shimmer_timer.cancel()
+            self._shimmer_timer = None
+
+        if state == "recording":
+            self.setHidden_(False)
+            self._levels = [0.0] * WAVEFORM_NUM_BARS
+            self._stop_animations()
+            self._set_all_bars_idle()
+        elif state == "transcribing":
+            self.setHidden_(False)
+            self._start_shimmer()
+        elif state == "done":
+            self._flash_done()
+        else:
+            self._stop_animations()
+            self._set_all_bars_idle()
+            self.setHidden_(True)
+
+    def update_level(self, db):
+        """Feed new audio level (dB). Called on main thread during recording."""
+        if self._state != "recording":
+            return
+        ratio = max(0.0, min(1.0, (db - METER_MIN_DB) / (METER_MAX_DB - METER_MIN_DB)))
+        self._levels.pop(0)
+        self._levels.append(ratio)
+        self._render_levels()
+
+    def _render_levels(self):
+        bounds = self.bounds()
+        center_y = bounds.size.height / 2.0
+        total_w = WAVEFORM_NUM_BARS * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP) - WAVEFORM_BAR_GAP
+        start_x = (bounds.size.width - total_w) / 2.0
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration_(0.06)
+        for i, bar in enumerate(self._bars):
+            ratio = self._levels[i]
+            h = WAVEFORM_BAR_MIN_H + ratio * (WAVEFORM_BAR_MAX_H - WAVEFORM_BAR_MIN_H)
+            x = start_x + i * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP)
+            y = center_y - h / 2.0
+            bar.setFrame_(((x, y), (WAVEFORM_BAR_WIDTH, h)))
+            # Color gradient: left=cyan, right=blue, intensity by level
+            t = i / max(1, WAVEFORM_NUM_BARS - 1)  # 0..1 across bars
+            r = 0.2 + 0.15 * t
+            g = 0.75 - 0.25 * t + 0.25 * ratio
+            b = 0.9 + 0.1 * ratio
+            a = 0.25 + 0.7 * ratio
+            bar.setBackgroundColor_(CGColorCreateGenericRGB(r, g, b, a))
+        CATransaction.commit()
+
+    def _set_all_bars_idle(self):
+        bounds = self.bounds()
+        center_y = bounds.size.height / 2.0
+        total_w = WAVEFORM_NUM_BARS * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP) - WAVEFORM_BAR_GAP
+        start_x = (bounds.size.width - total_w) / 2.0
+        CATransaction.begin()
+        CATransaction.setAnimationDuration_(0.3)
+        for i, bar in enumerate(self._bars):
+            x = start_x + i * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP)
+            h = WAVEFORM_BAR_MIN_H
+            y = center_y - h / 2.0
+            bar.setFrame_(((x, y), (WAVEFORM_BAR_WIDTH, h)))
+            bar.setBackgroundColor_(CGColorCreateGenericRGB(1.0, 1.0, 1.0, 0.15))
+            bar.setOpacity_(1.0)
+        CATransaction.commit()
+
+    def _start_shimmer(self):
+        """Traveling wave shimmer for transcribing state."""
+        self._stop_animations()
+        bounds = self.bounds()
+        center_y = bounds.size.height / 2.0
+        total_w = WAVEFORM_NUM_BARS * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP) - WAVEFORM_BAR_GAP
+        start_x = (bounds.size.width - total_w) / 2.0
+
+        # Set bars to a base state
+        CATransaction.begin()
+        CATransaction.setDisableActions_(True)
+        for i, bar in enumerate(self._bars):
+            x = start_x + i * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP)
+            bar.setFrame_(((x, center_y - 3), (WAVEFORM_BAR_WIDTH, 6)))
+            bar.setBackgroundColor_(CGColorCreateGenericRGB(0.5, 0.8, 1.0, 0.5))
+            bar.setOpacity_(0.3)
+        CATransaction.commit()
+
+        # Add shimmer animation to each bar with phase offset
+        for i, bar in enumerate(self._bars):
+            anim = CABasicAnimation.animationWithKeyPath_("opacity")
+            anim.setFromValue_(0.15)
+            anim.setToValue_(0.8)
+            anim.setDuration_(0.8)
+            anim.setAutoreverses_(True)
+            anim.setRepeatCount_(1e6)
+            # Stagger: each bar starts slightly after the previous
+            begin = _ca_lib.CACurrentMediaTime() + i * 0.04
+            anim.setBeginTime_(begin)
+            bar.addAnimation_forKey_(anim, "shimmer")
+
+            # Also animate height for a wave effect
+            h_anim = CABasicAnimation.animationWithKeyPath_("bounds.size.height")
+            h_anim.setFromValue_(4.0)
+            h_anim.setToValue_(12.0)
+            h_anim.setDuration_(0.8)
+            h_anim.setAutoreverses_(True)
+            h_anim.setRepeatCount_(1e6)
+            h_anim.setBeginTime_(begin)
+            bar.addAnimation_forKey_(h_anim, "wave")
+
+        self._levels = [0.0] * WAVEFORM_NUM_BARS
+
+    def _flash_done(self):
+        """Brief green flash then fade to idle."""
+        CATransaction.begin()
+        CATransaction.setAnimationDuration_(0.15)
+        for bar in self._bars:
+            bar.removeAllAnimations()
+            bar.setBackgroundColor_(CGColorCreateGenericRGB(0.2, 0.9, 0.4, 0.9))
+            bar.setOpacity_(1.0)
+        CATransaction.commit()
+
+        def _fade_out():
+            def _do():
+                if self._state == "done":
+                    self._set_all_bars_idle()
+                    self.setHidden_(True)
+            AppHelper.callAfter(_do)
+        t = threading.Timer(0.6, _fade_out)
+        t.daemon = True
+        t.start()
+
+    def _stop_animations(self):
+        for bar in self._bars:
+            bar.removeAllAnimations()
 
 
 # ── rounded view ───────────────────────────────────────────
@@ -676,6 +957,7 @@ class AppDelegate(NSObject):
         self._fn_press_time = 0.0
         self._asr_watchdog = None
         self._recording_timeout = None
+        self.waveform_view = None
         return self
 
     def applicationDidFinishLaunching_(self, notification):
@@ -719,7 +1001,7 @@ class AppDelegate(NSObject):
         )
 
         self.label = NSTextField.labelWithString_(IDLE_LABEL)
-        self.label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(10.5, 0.25))
+        self.label.setFont_(NSFont.systemFontOfSize_weight_(10.5, 0.3))
         self.label.setTextColor_(NSColor.whiteColor())
         self.label.setAlignment_(1)  # center
         label_w = INDICATOR_WIDTH_NORMAL - 12
@@ -737,8 +1019,14 @@ class AppDelegate(NSObject):
         self.copy_btn.setAction_(objc.selector(self.copyClicked_, signature=b"v@:@"))
         self.copy_btn.setHidden_(True)
 
+        # Waveform visualization (hidden by default, shown during recording/transcribing)
+        self.waveform_view = WaveformView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, INDICATOR_WIDTH_RECORDING, INDICATOR_HEIGHT_RECORDING)
+        )
+
         self.rounded_view.addSubview_(self.label)
         self.rounded_view.addSubview_(self.copy_btn)
+        self.rounded_view.addSubview_(self.waveform_view)
         self.indicator.contentView().addSubview_(self.rounded_view)
         self._order_indicator_front()
 
@@ -759,6 +1047,7 @@ class AppDelegate(NSObject):
 
     def _update_indicator(self, text, bg_r, bg_g, bg_b, bg_a=0.92):
         def update():
+            self.label.setHidden_(False)
             self.label.setStringValue_(text)
             self.rounded_view.setBgColor_(
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(
@@ -778,20 +1067,13 @@ class AppDelegate(NSObject):
             (1.0 - METER_EMA_ALPHA) * self._meter_db_smooth
             + METER_EMA_ALPHA * db_clamped
         )
-        ratio = (self._meter_db_smooth - METER_MIN_DB) / (METER_MAX_DB - METER_MIN_DB)
-        pos = int(round(ratio * (METER_LINE_WIDTH - 1)))
-        pos = max(0, min(METER_LINE_WIDTH - 1, pos))
-        line_chars = ["─"] * METER_LINE_WIDTH
-        line_chars[pos] = "│"
-        label_text = f"♪ {''.join(line_chars)}"
+
+        smooth_db = self._meter_db_smooth
 
         def update():
             if not self.is_recording:
                 return
-            self.label.setStringValue_(label_text)
-            self.rounded_view.setBgColor_(
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.17, 0.17, 0.17, 0.52)
-            )
+            self.waveform_view.update_level(smooth_db)
             self._order_indicator_front()
 
         AppHelper.callAfter(update)
@@ -801,10 +1083,14 @@ class AppDelegate(NSObject):
             if self._hide_timer:
                 self._hide_timer.cancel()
 
+            # Flash waveform green then hide it
+            self.waveform_view.set_state("done")
+
             self._resize_indicator(INDICATOR_WIDTH_RESULT)
             self.indicator.setIgnoresMouseEvents_(False)
             self.copy_btn.setHidden_(True)
-            self.label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(10.5, 0.25))
+            self.label.setHidden_(False)
+            self.label.setFont_(NSFont.systemFontOfSize_weight_(10.5, 0.3))
             label_w = INDICATOR_WIDTH_RESULT - 12
             label_h = 14
             label_x = 6
@@ -834,11 +1120,14 @@ class AppDelegate(NSObject):
                 self._hide_timer.cancel()
                 self._hide_timer = None
 
+            self.waveform_view.set_state("done")
+
             self._pending_copy_text = text
             self._resize_indicator(INDICATOR_WIDTH_COPY, INDICATOR_HEIGHT_COPY)
             self.indicator.setIgnoresMouseEvents_(False)
 
-            self.label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(10.5, 0.25))
+            self.label.setHidden_(False)
+            self.label.setFont_(NSFont.systemFontOfSize_weight_(10.5, 0.3))
             label_w = INDICATOR_WIDTH_COPY - 74
             label_h = 14
             label_x = 8
@@ -867,10 +1156,12 @@ class AppDelegate(NSObject):
     def _reset_indicator(self):
         def update():
             self._pending_copy_text = ""
+            self.waveform_view.set_state("idle")
             self._resize_indicator(INDICATOR_WIDTH_NORMAL)
             self.indicator.setIgnoresMouseEvents_(False)
             self.copy_btn.setHidden_(True)
-            self.label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(10.5, 0.25))
+            self.label.setHidden_(False)
+            self.label.setFont_(NSFont.systemFontOfSize_weight_(10.5, 0.3))
             label_w = INDICATOR_WIDTH_NORMAL - 12
             label_h = 14
             label_x = 6
@@ -925,6 +1216,24 @@ class AppDelegate(NSObject):
         mic_item.setSubmenu_(mic_submenu)
         menu.addItem_(mic_item)
         self._mic_submenu = mic_submenu
+
+        # ASR Backend submenu
+        asr_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "ASR Backend", "", ""
+        )
+        asr_submenu = NSMenu.alloc().init()
+        for backend_label, backend_val in [("Whisper (MLX)", "whisper"), ("Paraformer (FunASR)", "paraformer")]:
+            bi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                backend_label, "ctxSelectBackend:", ""
+            )
+            bi.setTarget_(self)
+            bi.setRepresentedObject_(backend_val)
+            if backend_val == ASR_BACKEND:
+                bi.setState_(1)
+            asr_submenu.addItem_(bi)
+        asr_item.setSubmenu_(asr_submenu)
+        menu.addItem_(asr_item)
+        self._asr_submenu = asr_submenu
 
         menu.addItem_(NSMenuItem.separatorItem())
         quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -993,6 +1302,28 @@ class AppDelegate(NSObject):
             print("[whisper_dictate] Input device set to: system default")
         _save_config(cfg)
 
+    @objc.typedSelector(b"v@:@")
+    def ctxSelectBackend_(self, sender):
+        global ASR_BACKEND, _funasr_model
+        new_backend = sender.representedObject()
+        if new_backend == ASR_BACKEND:
+            return
+        ASR_BACKEND = new_backend
+        # Update checkmarks
+        for i in range(self._asr_submenu.numberOfItems()):
+            mi = self._asr_submenu.itemAtIndex_(i)
+            mi.setState_(1 if mi.representedObject() == new_backend else 0)
+        print(f"[whisper_dictate] ASR backend switched to: {ASR_BACKEND}")
+        self._update_indicator(LOADING_LABEL, 0.17, 0.17, 0.17, 0.52)
+        # Warm up the new backend in background
+        def _switch_warmup():
+            if new_backend == "paraformer":
+                _get_funasr_model()
+            warmup_model()
+            self._update_indicator(IDLE_LABEL, 0.17, 0.17, 0.17, 0.52)
+            print(f"[whisper_dictate] {ASR_BACKEND} backend ready.")
+        threading.Thread(target=_switch_warmup, daemon=True).start()
+
     # ── model warmup ──
     def _warmup(self):
         self._update_indicator(LOADING_LABEL, 0.17, 0.17, 0.17, 0.52)
@@ -1011,7 +1342,10 @@ class AppDelegate(NSObject):
                 print("[whisper_dictate] Event tap re-enabled.")
                 try:
                     cur = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState)
-                    fn_actual = bool(cur & FN_FLAG)
+                    if USE_CTRL_OPT:
+                        fn_actual = bool((cur & CTRL_FLAG) and (cur & OPT_FLAG))
+                    else:
+                        fn_actual = bool(cur & FN_FLAG)
                     if self._fn_held and not fn_actual:
                         print("[whisper_dictate] FN sync: was held but now released, triggering release")
                         self._fn_held = False
@@ -1025,14 +1359,25 @@ class AppDelegate(NSObject):
                 return event
 
             flags = CGEventGetFlags(event)
-            fn_now = bool(flags & FN_FLAG)
-
-            if fn_now and not self._fn_held:
-                self._fn_held = True
-                self._on_fn_press()
-            elif not fn_now and self._fn_held:
-                self._fn_held = False
-                self._on_fn_release()
+            if USE_CTRL_OPT:
+                fn_now = bool((flags & CTRL_FLAG) and (flags & OPT_FLAG))
+                # For Ctrl+Option: only stop when BOTH are released
+                either_held = bool((flags & CTRL_FLAG) or (flags & OPT_FLAG))
+                if fn_now and not self._fn_held:
+                    self._fn_held = True
+                    self._on_fn_press()
+                elif not either_held and self._fn_held:
+                    # Only trigger release when neither Ctrl nor Option is held
+                    self._fn_held = False
+                    self._on_fn_release()
+            else:
+                fn_now = bool(flags & FN_FLAG)
+                if fn_now and not self._fn_held:
+                    self._fn_held = True
+                    self._on_fn_press()
+                elif not fn_now and self._fn_held:
+                    self._fn_held = False
+                    self._on_fn_release()
 
             return event
 
@@ -1062,13 +1407,23 @@ class AppDelegate(NSObject):
         def add_monitor():
             def handler(event):
                 flags = event.modifierFlags()
-                fn_now = bool(flags & (1 << 23))
-                if fn_now and not self._fn_held:
-                    self._fn_held = True
-                    self._on_fn_press()
-                elif not fn_now and self._fn_held:
-                    self._fn_held = False
-                    self._on_fn_release()
+                if USE_CTRL_OPT:
+                    fn_now = bool((flags & CTRL_FLAG) and (flags & OPT_FLAG))
+                    either_held = bool((flags & CTRL_FLAG) or (flags & OPT_FLAG))
+                    if fn_now and not self._fn_held:
+                        self._fn_held = True
+                        self._on_fn_press()
+                    elif not either_held and self._fn_held:
+                        self._fn_held = False
+                        self._on_fn_release()
+                else:
+                    fn_now = bool(flags & (1 << 23))
+                    if fn_now and not self._fn_held:
+                        self._fn_held = True
+                        self._on_fn_press()
+                    elif not fn_now and self._fn_held:
+                        self._fn_held = False
+                        self._on_fn_release()
 
             monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
                 NSFlagsChangedMask, handler
@@ -1100,17 +1455,16 @@ class AppDelegate(NSObject):
             self._resize_indicator(INDICATOR_WIDTH_RECORDING, INDICATOR_HEIGHT_RECORDING)
             self.indicator.setIgnoresMouseEvents_(False)
             self.copy_btn.setHidden_(True)
-            self.label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(10.5, 0.25))
-            label_w = INDICATOR_WIDTH_RECORDING - 12
-            label_h = 14
-            label_x = 6
-            label_y = (INDICATOR_HEIGHT_RECORDING - label_h) / 2
-            self.label.setFrame_(NSMakeRect(label_x, label_y, label_w, label_h))
-            self.label.setAlignment_(1)
+            self.label.setHidden_(True)
             self._meter_db_smooth = METER_MIN_DB
-            self.label.setStringValue_(f"♪ {'─' * METER_LINE_WIDTH}")
+            # Show waveform and resize it to match
+            self.waveform_view.setFrame_(
+                NSMakeRect(0, 0, INDICATOR_WIDTH_RECORDING, INDICATOR_HEIGHT_RECORDING)
+            )
+            self.waveform_view.relayout()
+            self.waveform_view.set_state("recording")
             self.rounded_view.setBgColor_(
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.17, 0.17, 0.17, 0.52)
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.12, 0.12, 0.12, 0.88)
             )
             self._order_indicator_front()
         AppHelper.callAfter(reset_and_record)
@@ -1178,9 +1532,8 @@ class AppDelegate(NSObject):
 
         # Normal release — stream stop + transcription all in background thread
         self.is_transcribing = True
-        self._resize_indicator(INDICATOR_WIDTH_NORMAL)
-        self.label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(10.5, 0.25))
-        self._update_indicator(TRANSCRIBING_LABEL, 0.17, 0.17, 0.17, 0.52)
+        # Switch waveform to shimmer animation for transcribing
+        self.waveform_view.set_state("transcribing")
 
         if self._asr_watchdog:
             self._asr_watchdog.cancel()
@@ -1189,7 +1542,11 @@ class AppDelegate(NSObject):
             if self.is_transcribing:
                 print(f"[whisper_dictate] WATCHDOG: ASR timeout ({ASR_WATCHDOG_SEC}s), resetting")
                 self.is_transcribing = False
-                self._update_indicator(IDLE_LABEL, 0.17, 0.17, 0.17, 0.52)
+                def _reset():
+                    self.waveform_view.set_state("idle")
+                    self.label.setHidden_(False)
+                    self._update_indicator(IDLE_LABEL, 0.17, 0.17, 0.17, 0.52)
+                AppHelper.callAfter(_reset)
 
         self._asr_watchdog = threading.Timer(ASR_WATCHDOG_SEC, _asr_timeout)
         self._asr_watchdog.daemon = True
@@ -1198,8 +1555,6 @@ class AppDelegate(NSObject):
         threading.Thread(target=self._transcribe, args=(stream_ref,), daemon=True).start()
 
     def _transcribe(self, stream_ref=None):
-        import mlx_whisper
-
         # Stop/close audio stream in background thread (not blocking main RunLoop)
         if stream_ref:
             try:
@@ -1224,7 +1579,8 @@ class AppDelegate(NSObject):
             duration = len(audio) / SAMPLE_RATE
             print(
                 f"[whisper_dictate] Transcribing {duration:.1f}s audio "
-                f"(raw={raw_duration:.1f}s, tail_trim={trimmed_tail_sec:.2f}s)..."
+                f"(raw={raw_duration:.1f}s, tail_trim={trimmed_tail_sec:.2f}s) "
+                f"[backend={ASR_BACKEND}]..."
             )
 
             if duration < MIN_AUDIO_DURATION_SEC:
@@ -1234,7 +1590,7 @@ class AppDelegate(NSObject):
                 )
                 return
 
-            tmp = tempfile.mktemp(suffix=".wav")
+            tmp = _secure_tmpfile()
             sf.write(tmp, audio, SAMPLE_RATE)
 
             self.keywords = load_keywords()
@@ -1245,19 +1601,38 @@ class AppDelegate(NSObject):
                     f"[whisper_dictate] Keywords trimmed: "
                     f"{kw_len} -> {len(self.keywords)} chars"
                 )
-            kwargs = {"path_or_hf_repo": MODEL}
-            use_prompt = bool(self.keywords) and self._disable_prompt_rounds <= 0
-            if use_prompt:
-                kwargs["initial_prompt"] = self.keywords
-            elif self._disable_prompt_rounds > 0:
-                self._disable_prompt_rounds -= 1
-                print(
-                    f"[whisper_dictate] Prompt temporarily disabled, "
-                    f"rounds left={self._disable_prompt_rounds}"
-                )
 
             t_asr = time.monotonic()
-            result = mlx_whisper.transcribe(tmp, **kwargs)
+
+            if ASR_BACKEND == "paraformer":
+                use_prompt = False
+                m = _get_funasr_model()
+                res = m.generate(input=tmp)
+                # FunASR returns list of dicts with 'text' key
+                if res and isinstance(res, list) and len(res) > 0:
+                    raw_text_parts = []
+                    for seg in res:
+                        t = seg.get("text", "") if isinstance(seg, dict) else str(seg)
+                        if t:
+                            raw_text_parts.append(t)
+                    raw_text = "".join(raw_text_parts).strip()
+                else:
+                    raw_text = ""
+            else:
+                import mlx_whisper
+                kwargs = {"path_or_hf_repo": WHISPER_MODEL}
+                use_prompt = bool(self.keywords) and self._disable_prompt_rounds <= 0
+                if use_prompt:
+                    kwargs["initial_prompt"] = self.keywords
+                elif self._disable_prompt_rounds > 0:
+                    self._disable_prompt_rounds -= 1
+                    print(
+                        f"[whisper_dictate] Prompt temporarily disabled, "
+                        f"rounds left={self._disable_prompt_rounds}"
+                    )
+                result = mlx_whisper.transcribe(tmp, **kwargs)
+                raw_text = result.get("text", "").strip()
+
             t_asr_done = time.monotonic()
             asr_sec = t_asr_done - t_asr
             rtf = asr_sec / max(duration, 0.1)
@@ -1277,7 +1652,6 @@ class AppDelegate(NSObject):
                     f"disable prompt for next {self._disable_prompt_rounds} rounds. "
                     f"(asr={asr_sec:.2f}s, rtf={rtf:.2f})"
                 )
-            raw_text = result.get("text", "").strip()
             os.unlink(tmp)
             tmp = None
 
@@ -1370,7 +1744,7 @@ class AppDelegate(NSObject):
         app_path = os.path.expanduser("~/Applications/WhisperDictate.app")
         if os.path.exists(app_path):
             subprocess.Popen(
-                ["bash", "-c", f"sleep 1 && open '{app_path}'"],
+                ["bash", "-c", "sleep 1 && open \"$1\"", "_", app_path],
                 start_new_session=True,
             )
             os._exit(0)
@@ -1382,10 +1756,12 @@ class AppDelegate(NSObject):
 # ── main ───────────────────────────────────────────────────
 def _acquire_lock():
     """Ensure only one instance runs. Exit if another is already active."""
-    lock_path = os.path.join(tempfile.gettempdir(), "whisper_dictate.lock")
+    lock_path = os.path.expanduser("~/.config/whisper/whisper_dictate.lock")
     try:
         import fcntl
-        lock_fd = open(lock_path, "w")
+        _ensure_private_dir(lock_path)
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        lock_fd = os.fdopen(fd, "w")
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         lock_fd.write(str(os.getpid()))
         lock_fd.flush()
@@ -1397,13 +1773,18 @@ def _acquire_lock():
 
 def main():
     _acquire_lock()
-    os.makedirs(os.path.dirname(KEYWORDS_FILE), exist_ok=True)
+    _ensure_private_dir(KEYWORDS_FILE)
+    _rotate_log_if_needed()
     ensure_history_file()
+    _set_private(HISTORY_FILE)
+    _set_private(LOG_FILE)
     if not os.path.exists(KEYWORDS_FILE):
         with open(KEYWORDS_FILE, "w") as f:
             f.write("NVIDIA, Tesla, S&P 500, Bitcoin, Apple, Microsoft, Google")
+    _set_private(KEYWORDS_FILE)
 
-    print("[whisper_dictate] Starting v2... (hold FN to talk)")
+    hotkey_name = "Ctrl+Option" if USE_CTRL_OPT else "FN"
+    print(f"[whisper_dictate] Starting v2... (hold {hotkey_name} to talk)")
     print(f"[whisper_dictate] Keywords: {KEYWORDS_FILE}")
     print(f"[whisper_dictate] History: {HISTORY_FILE}")
 
