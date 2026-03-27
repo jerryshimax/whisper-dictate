@@ -16,10 +16,6 @@ LOG_FILE = os.path.expanduser("~/.config/whisper/app.log")
 
 # ── ASR models ─────────────────────────────────────────────
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-ASR_BACKEND = "whisper"  # "whisper" or "paraformer"
-PARAFORMER_MODEL = "paraformer-zh"
-PARAFORMER_VAD = "fsmn-vad"
-PARAFORMER_PUNC = "ct-punc"
 
 # ── audio ──────────────────────────────────────────────────
 SAMPLE_RATE = 16000
@@ -42,20 +38,20 @@ ASR_WATCHDOG_SEC = 30.0
 RECORDING_TIMEOUT_SEC = 120.0
 ASR_SLOW_STREAK_TRIGGER = 1
 PROMPT_DISABLE_ROUNDS_ON_SLOW = 6
-KEYWORDS_MAX_CHARS = 900
+KEYWORDS_MAX_CHARS = 800  # ~200 words ≈ ~220 Whisper tokens (224 token limit)
 MIN_AUDIO_DURATION_SEC = 0.6
 TRAILING_SILENCE_WINDOW_SEC = 0.05
 TRAILING_SILENCE_HOLD_SEC = 0.28
 TRAILING_SILENCE_DB_THRESHOLD = -42.0
 
 # ── indicator appearance ───────────────────────────────────
-INDICATOR_WIDTH_NORMAL = 170
+INDICATOR_WIDTH_NORMAL = 120
 INDICATOR_WIDTH_RECORDING = 200
-INDICATOR_WIDTH_RESULT = 170
-INDICATOR_WIDTH_COPY = 240
-INDICATOR_HEIGHT = 20
-INDICATOR_HEIGHT_RECORDING = 26
-INDICATOR_HEIGHT_COPY = 26
+INDICATOR_WIDTH_RESULT = 120
+INDICATOR_WIDTH_COPY = 220
+INDICATOR_HEIGHT = 24
+INDICATOR_HEIGHT_RECORDING = 28
+INDICATOR_HEIGHT_COPY = 28
 INDICATOR_BOTTOM_MARGIN = 65
 INDICATOR_CORNER_RADIUS = 12
 RESULT_DISPLAY_SECONDS = 5
@@ -63,11 +59,11 @@ METER_UPDATE_INTERVAL_SEC = 0.06  # ~16 fps
 METER_MIN_DB = -55.0
 METER_MAX_DB = 0.0
 METER_EMA_ALPHA = 0.22
-IDLE_LABEL = "◦  dictate"
-TRANSCRIBING_LABEL = "✎  ···"
-LOADING_LABEL = "◦  loading"
-DONE_LABEL = "✓  done"
-COPY_READY_LABEL = "✓ Ready to Copy"
+IDLE_LABEL = "●  ready"
+TRANSCRIBING_LABEL = "◌  thinking"
+LOADING_LABEL = "◌  loading"
+DONE_LABEL = "✓  pasted"
+COPY_READY_LABEL = "✓  copied"
 
 # ── waveform bars ──────────────────────────────────────────
 WAVEFORM_NUM_BARS = 28
@@ -108,7 +104,6 @@ def _secure_tmpfile(suffix: str = ".wav") -> str:
 # ── config load / save ─────────────────────────────────────
 _CONFIG_DEFAULTS: dict = {
     "input_device": None,
-    "asr_backend": "whisper",
     "whisper_model": WHISPER_MODEL,
     "history_retention_days": HISTORY_RETENTION_DAYS,
 }
@@ -136,9 +131,14 @@ def save_user_config(cfg: dict) -> None:
 
 # ── keywords ───────────────────────────────────────────────
 def load_keywords() -> str:
-    """Read keywords.txt and return comma-joined string."""
+    """Read keywords.txt as natural-language prompt text.
+
+    Sentences are joined with spaces (not commas) to preserve natural
+    language structure, which Whisper's decoder uses more effectively
+    than bare keyword lists.
+    """
     if os.path.exists(KEYWORDS_FILE):
-        with open(KEYWORDS_FILE, "r") as f:
+        with open(KEYWORDS_FILE, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-            return ", ".join(lines)
+            return " ".join(lines)
     return ""

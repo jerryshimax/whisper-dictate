@@ -32,7 +32,7 @@ class RoundedView(NSView):
         if self is None:
             return None
         self._bg_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.15, 0.15, 0.15, 0.92
+            0.1, 0.1, 0.1, 0.85
         )
         return self
 

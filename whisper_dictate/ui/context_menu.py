@@ -7,15 +7,15 @@ import sounddevice as sd
 from AppKit import NSMenu, NSMenuItem
 
 from whisper_dictate.audio import _get_input_devices
-from whisper_dictate.config import ASR_BACKEND, load_user_config
+from whisper_dictate.config import load_user_config
 
 logger = logging.getLogger("whisper_dictate.ui.context_menu")
 
 
-def build_context_menu(delegate) -> tuple[NSMenu, NSMenu, NSMenu]:
+def build_context_menu(delegate) -> tuple[NSMenu, NSMenu]:
     """Build the right-click context menu.
 
-    Returns (menu, mic_submenu, asr_submenu) so the delegate can store references.
+    Returns (menu, mic_submenu) so the delegate can store references.
     """
     menu = NSMenu.alloc().init()
     for title, action in [
@@ -39,33 +39,13 @@ def build_context_menu(delegate) -> tuple[NSMenu, NSMenu, NSMenu]:
     mic_item.setSubmenu_(mic_submenu)
     menu.addItem_(mic_item)
 
-    # ASR Backend submenu
-    asr_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "ASR Backend", "", ""
-    )
-    asr_submenu = NSMenu.alloc().init()
-    for backend_label, backend_val in [
-        ("Whisper (MLX)", "whisper"),
-        ("Paraformer (FunASR)", "paraformer"),
-    ]:
-        bi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            backend_label, "ctxSelectBackend:", ""
-        )
-        bi.setTarget_(delegate)
-        bi.setRepresentedObject_(backend_val)
-        if backend_val == ASR_BACKEND:
-            bi.setState_(1)
-        asr_submenu.addItem_(bi)
-    asr_item.setSubmenu_(asr_submenu)
-    menu.addItem_(asr_item)
-
     menu.addItem_(NSMenuItem.separatorItem())
     quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         "Quit", "terminate:", ""
     )
     menu.addItem_(quit_item)
 
-    return menu, mic_submenu, asr_submenu
+    return menu, mic_submenu
 
 
 def refresh_mic_submenu(submenu: NSMenu, delegate) -> None:

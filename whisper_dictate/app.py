@@ -33,7 +33,6 @@ from Quartz import kCGFloatingWindowLevel
 from PyObjCTools import AppHelper
 
 from whisper_dictate.config import (
-    ASR_BACKEND,
     ASR_SLOW_RTF_THRESHOLD,
     ASR_SLOW_STREAK_TRIGGER,
     ASR_SLOW_THRESHOLD_SEC,
@@ -77,7 +76,7 @@ from whisper_dictate.logging_setup import setup_logging
 from whisper_dictate.postprocessor import postprocess_fast
 from whisper_dictate.audio import _trim_trailing_silence, _resolve_input_device
 from whisper_dictate.clipboard import paste_text
-from whisper_dictate.history import save_history, cleanup_history, ensure_history_file
+from whisper_dictate.history import save_history, cleanup_history, ensure_history_file, suggest_keywords
 from whisper_dictate.macos import (
     get_frontmost_app_id,
     get_front_window_title,
@@ -85,16 +84,13 @@ from whisper_dictate.macos import (
     run_memory_maintenance,
     _normalize_window_title,
 )
-from whisper_dictate.asr import warmup_model, transcribe, _get_funasr_model
+from whisper_dictate.asr import warmup_model, transcribe
 from whisper_dictate.event_tap import setup_event_tap, EventTapState
 from whisper_dictate.ui.indicator import RoundedView
 from whisper_dictate.ui.waveform import WaveformView
 from whisper_dictate.ui.context_menu import build_context_menu, refresh_mic_submenu
 
 logger = logging.getLogger("whisper_dictate.app")
-
-# Mutable module-level ASR backend (togglable at runtime via context menu)
-_asr_backend = ASR_BACKEND
 
 
 class AppDelegate(NSObject):
@@ -125,7 +121,6 @@ class AppDelegate(NSObject):
         self._recording_timeout = None
         self.waveform_view = None
         self._mic_submenu = None
-        self._asr_submenu = None
         self._event_tap_state = EventTapState()
         return self
 
@@ -174,8 +169,10 @@ class AppDelegate(NSObject):
         )
 
         self.label = NSTextField.labelWithString_(IDLE_LABEL)
-        self.label.setFont_(NSFont.systemFontOfSize_weight_(10.5, 0.3))
-        self.label.setTextColor_(NSColor.whiteColor())
+        self.label.setFont_(NSFont.systemFontOfSize_weight_(11.0, 0.25))
+        self.label.setTextColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.92, 0.92, 0.92, 0.9)
+        )
         self.label.setAlignment_(1)  # center
         label_w = INDICATOR_WIDTH_NORMAL - 12
         label_h = 14
@@ -263,7 +260,7 @@ class AppDelegate(NSObject):
             self.indicator.setIgnoresMouseEvents_(False)
             self.copy_btn.setHidden_(True)
             self.label.setHidden_(False)
-            self.label.setFont_(NSFont.systemFontOfSize_weight_(10.5, 0.3))
+            self.label.setFont_(NSFont.systemFontOfSize_weight_(11.0, 0.25))
             label_w = INDICATOR_WIDTH_RESULT - 12
             label_h = 14
             label_x = 6
@@ -274,7 +271,7 @@ class AppDelegate(NSObject):
 
             self.rounded_view.setBgColor_(
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                    0.17, 0.17, 0.17, 0.52
+                    0.1, 0.1, 0.1, 0.55
                 )
             )
 
@@ -300,7 +297,7 @@ class AppDelegate(NSObject):
             self.indicator.setIgnoresMouseEvents_(False)
 
             self.label.setHidden_(False)
-            self.label.setFont_(NSFont.systemFontOfSize_weight_(10.5, 0.3))
+            self.label.setFont_(NSFont.systemFontOfSize_weight_(11.0, 0.25))
             label_w = INDICATOR_WIDTH_COPY - 74
             label_h = 14
             label_x = 8
@@ -334,7 +331,7 @@ class AppDelegate(NSObject):
             self.indicator.setIgnoresMouseEvents_(False)
             self.copy_btn.setHidden_(True)
             self.label.setHidden_(False)
-            self.label.setFont_(NSFont.systemFontOfSize_weight_(10.5, 0.3))
+            self.label.setFont_(NSFont.systemFontOfSize_weight_(11.0, 0.25))
             label_w = INDICATOR_WIDTH_NORMAL - 12
             label_h = 14
             label_x = 6
@@ -344,7 +341,7 @@ class AppDelegate(NSObject):
             self.label.setStringValue_(IDLE_LABEL)
             self.rounded_view.setBgColor_(
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                    0.17, 0.17, 0.17, 0.52
+                    0.1, 0.1, 0.1, 0.55
                 )
             )
             self._order_indicator_front()
@@ -367,9 +364,8 @@ class AppDelegate(NSObject):
 
     # ── right-click context menu on floating indicator ──
     def _setup_right_click_menu(self):
-        menu, mic_submenu, asr_submenu = build_context_menu(self)
+        menu, mic_submenu = build_context_menu(self)
         self._mic_submenu = mic_submenu
-        self._asr_submenu = asr_submenu
         self.rounded_view._ctx_menu = menu
         self.rounded_view._app_delegate = self
 
@@ -404,37 +400,15 @@ class AppDelegate(NSObject):
             logger.info("Input device set to: system default")
         save_user_config(cfg)
 
-    @objc.typedSelector(b"v@:@")
-    def ctxSelectBackend_(self, sender):
-        global _asr_backend
-        new_backend = sender.representedObject()
-        if new_backend == _asr_backend:
-            return
-        _asr_backend = new_backend
-        # Update checkmarks
-        for i in range(self._asr_submenu.numberOfItems()):
-            mi = self._asr_submenu.itemAtIndex_(i)
-            mi.setState_(1 if mi.representedObject() == new_backend else 0)
-        logger.info("ASR backend switched to: %s", _asr_backend)
-        self._update_indicator(LOADING_LABEL, 0.17, 0.17, 0.17, 0.52)
-        # Warm up the new backend in background
-        def _switch_warmup():
-            if new_backend == "paraformer":
-                _get_funasr_model()
-            warmup_model(backend=new_backend)
-            self._update_indicator(IDLE_LABEL, 0.17, 0.17, 0.17, 0.52)
-            logger.info("%s backend ready.", _asr_backend)
-        threading.Thread(target=_switch_warmup, daemon=True).start()
-
     # ── model warmup ──
     def _warmup(self):
-        self._update_indicator(LOADING_LABEL, 0.17, 0.17, 0.17, 0.52)
-        warmup_model(backend=_asr_backend)
+        self._update_indicator(LOADING_LABEL, 0.1, 0.1, 0.1, 0.55)
+        warmup_model()
         if self._event_tap_state.event_tap_failed:
             logger.warning("Model loaded, but event tap failed — keeping error indicator.")
             self._update_indicator("\u26a0\ufe0f  Need Accessibility", 0.5, 0.2, 0.1)
         else:
-            self._update_indicator(IDLE_LABEL, 0.17, 0.17, 0.17, 0.52)
+            self._update_indicator(IDLE_LABEL, 0.1, 0.1, 0.1, 0.55)
             logger.info("Model loaded, ready.")
 
     # ── recording ──
@@ -530,7 +504,7 @@ class AppDelegate(NSObject):
                     except Exception:
                         logger.warning("Stream close error (ghost press)", exc_info=True)
                 threading.Thread(target=_close, args=(stream_ref,), daemon=True).start()
-            self._update_indicator(IDLE_LABEL, 0.17, 0.17, 0.17, 0.52)
+            self._update_indicator(IDLE_LABEL, 0.1, 0.1, 0.1, 0.55)
             return
 
         # Normal release — stream stop + transcription all in background thread
@@ -548,7 +522,7 @@ class AppDelegate(NSObject):
                 def _reset():
                     self.waveform_view.set_state("idle")
                     self.label.setHidden_(False)
-                    self._update_indicator(IDLE_LABEL, 0.17, 0.17, 0.17, 0.52)
+                    self._update_indicator(IDLE_LABEL, 0.1, 0.1, 0.1, 0.55)
                 AppHelper.callAfter(_reset)
 
         self._asr_watchdog = threading.Timer(ASR_WATCHDOG_SEC, _asr_timeout)
@@ -558,8 +532,6 @@ class AppDelegate(NSObject):
         threading.Thread(target=self._transcribe, args=(stream_ref,), daemon=True).start()
 
     def _transcribe(self, stream_ref=None):
-        global _asr_backend
-
         # Stop/close audio stream in background thread (not blocking main RunLoop)
         if stream_ref:
             try:
@@ -583,8 +555,8 @@ class AppDelegate(NSObject):
             audio, trimmed_tail_sec = _trim_trailing_silence(audio)
             duration = len(audio) / SAMPLE_RATE
             logger.info(
-                "Transcribing %.1fs audio (raw=%.1fs, tail_trim=%.2fs) [backend=%s]...",
-                duration, raw_duration, trimmed_tail_sec, _asr_backend,
+                "Transcribing %.1fs audio (raw=%.1fs, tail_trim=%.2fs)...",
+                duration, raw_duration, trimmed_tail_sec,
             )
 
             if duration < MIN_AUDIO_DURATION_SEC:
@@ -606,9 +578,8 @@ class AppDelegate(NSObject):
             use_prompt = (
                 bool(self.keywords)
                 and self._disable_prompt_rounds <= 0
-                and _asr_backend != "paraformer"
             )
-            if not use_prompt and self._disable_prompt_rounds > 0 and _asr_backend != "paraformer":
+            if not use_prompt and self._disable_prompt_rounds > 0:
                 self._disable_prompt_rounds -= 1
                 logger.info(
                     "Prompt temporarily disabled, rounds left=%d",
@@ -617,7 +588,6 @@ class AppDelegate(NSObject):
 
             raw_text, asr_sec = transcribe(
                 audio_path=tmp,
-                backend=_asr_backend,
                 keywords=self.keywords,
                 use_prompt=use_prompt,
             )
@@ -709,6 +679,10 @@ class AppDelegate(NSObject):
             if now - self._last_memory_maintenance_ts >= MEMORY_MAINTENANCE_INTERVAL_SEC:
                 run_memory_maintenance()
                 self._last_memory_maintenance_ts = now
+                # Mine history for keyword suggestions
+                suggestions = suggest_keywords()
+                if suggestions:
+                    logger.info("Keyword suggestions from history: %s", ", ".join(suggestions))
                 rss_mb = get_rss_mb()
                 if rss_mb > 0:
                     logger.info("RSS: %.0f MB (maintenance)", rss_mb)
@@ -724,7 +698,7 @@ class AppDelegate(NSObject):
             else:
                 self.is_transcribing = False
                 if not self._last_text or self.label.stringValue().startswith("\u270e"):
-                    self._update_indicator(IDLE_LABEL, 0.17, 0.17, 0.17, 0.52)
+                    self._update_indicator(IDLE_LABEL, 0.1, 0.1, 0.1, 0.55)
 
     def _auto_restart(self):
         """Relaunch to reclaim memory."""
