@@ -268,6 +268,9 @@ class AppDelegate(NSObject):
             self.label.setFrame_(NSMakeRect(label_x, label_y, label_w, label_h))
             self.label.setAlignment_(1)  # center
             self.label.setStringValue_(DONE_LABEL)
+            self.label.setTextColor_(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.3, 0.85, 0.45, 1.0)
+            )
 
             self.rounded_view.setBgColor_(
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(
@@ -339,6 +342,9 @@ class AppDelegate(NSObject):
             self.label.setFrame_(NSMakeRect(label_x, label_y, label_w, label_h))
             self.label.setAlignment_(1)  # center
             self.label.setStringValue_(IDLE_LABEL)
+            self.label.setTextColor_(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.92, 0.92, 0.92, 0.9)
+            )
             self.rounded_view.setBgColor_(
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(
                     0.1, 0.1, 0.1, 0.55

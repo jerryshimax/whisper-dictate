@@ -70,7 +70,7 @@ class WaveformView(NSView):
             y = center_y - h / 2.0
             bar.setFrame_(((x, y), (WAVEFORM_BAR_WIDTH, h)))
             bar.setCornerRadius_(WAVEFORM_BAR_RADIUS)
-            bar.setBackgroundColor_(CGColorCreateGenericRGB(1.0, 1.0, 1.0, 0.15))
+            bar.setBackgroundColor_(CGColorCreateGenericRGB(1.0, 0.15, 0.1, 0.4))
             self.layer().addSublayer_(bar)
             self._bars.append(bar)
 
@@ -127,19 +127,18 @@ class WaveformView(NSView):
         start_x = (bounds.size.width - total_w) / 2.0
 
         CATransaction.begin()
-        CATransaction.setAnimationDuration_(0.06)
+        CATransaction.setAnimationDuration_(0.05)
         for i, bar in enumerate(self._bars):
             ratio = self._levels[i]
             h = WAVEFORM_BAR_MIN_H + ratio * (WAVEFORM_BAR_MAX_H - WAVEFORM_BAR_MIN_H)
             x = start_x + i * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP)
             y = center_y - h / 2.0
             bar.setFrame_(((x, y), (WAVEFORM_BAR_WIDTH, h)))
-            # Color gradient: left=cyan, right=blue, intensity by level
-            t = i / max(1, WAVEFORM_NUM_BARS - 1)  # 0..1 across bars
-            r = 0.2 + 0.15 * t
-            g = 0.75 - 0.25 * t + 0.25 * ratio
-            b = 0.9 + 0.1 * ratio
-            a = 0.25 + 0.7 * ratio
+            # Red bars — vivid, brightness responds to volume
+            a = 0.5 + 0.5 * ratio
+            r = 1.0
+            g = 0.15 * (1.0 - ratio)
+            b = 0.1 * (1.0 - ratio)
             bar.setBackgroundColor_(CGColorCreateGenericRGB(r, g, b, a))
         CATransaction.commit()
 
@@ -155,7 +154,7 @@ class WaveformView(NSView):
             h = WAVEFORM_BAR_MIN_H
             y = center_y - h / 2.0
             bar.setFrame_(((x, y), (WAVEFORM_BAR_WIDTH, h)))
-            bar.setBackgroundColor_(CGColorCreateGenericRGB(1.0, 1.0, 1.0, 0.15))
+            bar.setBackgroundColor_(CGColorCreateGenericRGB(1.0, 0.15, 0.1, 0.4))
             bar.setOpacity_(1.0)
         CATransaction.commit()
 
@@ -173,7 +172,7 @@ class WaveformView(NSView):
         for i, bar in enumerate(self._bars):
             x = start_x + i * (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP)
             bar.setFrame_(((x, center_y - 3), (WAVEFORM_BAR_WIDTH, 6)))
-            bar.setBackgroundColor_(CGColorCreateGenericRGB(0.5, 0.8, 1.0, 0.5))
+            bar.setBackgroundColor_(CGColorCreateGenericRGB(1.0, 0.15, 0.1, 0.5))
             bar.setOpacity_(0.3)
         CATransaction.commit()
 
@@ -208,7 +207,7 @@ class WaveformView(NSView):
         CATransaction.setAnimationDuration_(0.15)
         for bar in self._bars:
             bar.removeAllAnimations()
-            bar.setBackgroundColor_(CGColorCreateGenericRGB(0.2, 0.9, 0.4, 0.9))
+            bar.setBackgroundColor_(CGColorCreateGenericRGB(0.3, 0.85, 0.45, 0.9))
             bar.setOpacity_(1.0)
         CATransaction.commit()
 
