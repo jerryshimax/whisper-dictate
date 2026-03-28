@@ -544,7 +544,13 @@ class AppDelegate(NSObject):
     def _on_fn_release(self):
         if not self.is_recording:
             return
+        # In toggle mode, ignore releases (stop happens on next press)
+        if self._toggle_recording:
+            logger.info("Toggle mode active, ignoring release")
+            return
         hold_duration = time.monotonic() - self._fn_press_time
+        logger.info("Release: hold=%.3fs (ghost<%.1f, tap<%.1f)",
+                     hold_duration, FN_MIN_HOLD_SEC, TAP_MAX_HOLD_SEC)
 
         if hold_duration < FN_MIN_HOLD_SEC:
             # Ghost press (modifier key re-assertion) — discard silently
@@ -571,6 +577,7 @@ class AppDelegate(NSObject):
             return
 
         # Long hold → stop and transcribe (hold-to-talk)
+        logger.info("Hold-to-talk: stopping and transcribing")
         self._stop_and_transcribe()
 
     def _transcribe(self, stream_ref=None):
@@ -745,12 +752,11 @@ class AppDelegate(NSObject):
                 self._auto_restart()
             else:
                 self.is_transcribing = False
-                if not self._last_text or self.label.stringValue().startswith("\u270e"):
-                    def _reset_waveform():
-                        self.waveform_view.set_state("idle")
-                        self.label.setHidden_(False)
-                    AppHelper.callAfter(_reset_waveform)
-                    self._update_indicator(IDLE_LABEL, 0.1, 0.1, 0.1, 0.55)
+                def _reset_all():
+                    self.waveform_view.set_state("idle")
+                    self.label.setHidden_(False)
+                AppHelper.callAfter(_reset_all)
+                self._update_indicator(IDLE_LABEL, 0.1, 0.1, 0.1, 0.55)
 
     def _auto_restart(self):
         """Relaunch to reclaim memory."""

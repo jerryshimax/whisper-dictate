@@ -32,7 +32,7 @@ CLIPBOARD_RESTORE_DELAY_SEC = 0.15
 MEMORY_SOFT_LIMIT_MB = 2500
 MEMORY_MAINTENANCE_INTERVAL_SEC = 2 * 60 * 60  # 2 h
 FN_MIN_HOLD_SEC = 0.2
-TAP_MAX_HOLD_SEC = 0.4           # tap < 0.4s = toggle mode; hold >= 0.4s = hold-to-talk
+TAP_MAX_HOLD_SEC = 0.6           # tap < 0.6s = toggle mode; hold >= 0.6s = hold-to-talk
 ASR_SLOW_THRESHOLD_SEC = 10.0
 ASR_SLOW_RTF_THRESHOLD = 1.8
 ASR_WATCHDOG_SEC = 30.0

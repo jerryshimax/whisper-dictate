@@ -1,23 +1,27 @@
 # WhisperDictate
 
-Local voice input for macOS — hold a hotkey, speak, release. Text appears at your cursor.
+Local voice input for macOS — hold or tap a hotkey, speak, text appears at your cursor. 100% local, no cloud, no subscription.
 
-Two ASR backends: [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon optimized) and [FunASR Paraformer](https://github.com/modelscope/FunASR) (fast Chinese-English). Switch between them from the right-click menu, no restart needed.
+Built on [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon optimized) with LLM-powered punctuation polishing.
 
 [中文教程 / Chinese Guide](README_CN.md)
 
 ## Features
 
 - **100% Local & Private** — no cloud, no API keys, audio never leaves your Mac
-- **Free** — no subscription, no limits
-- **Two ASR Backends** — Whisper (best English) or Paraformer (fastest Chinese-English mix)
+- **Free & Open Source** — no subscription, no limits
+- **Two Input Modes**:
+  - **Hold-to-Talk** — hold Ctrl+Option, speak, release to transcribe
+  - **Tap-to-Toggle** — quick tap to start, tap again to stop (hands-free)
+- **LLM Punctuation Polish** — local Qwen2.5-0.5B fixes capitalization, periods, commas (~0.15s)
+- **Brain Vault Keywords** — auto-scans your Obsidian vault for people names, companies, and domain terms to improve recognition
 - **Animated Waveform** — live audio visualization during recording, shimmer during transcription
-- **Hold-to-Talk** — Ctrl+Option to record, release to transcribe and auto-paste
+- **Sound Alerts** — Tink on start, Ping on done — no need to watch the screen
 - **Chinese-English Code-Switching** — speak mixed languages in one sentence
-- **Smart Post-Processing** — removes hallucinations, repetitions, and filler words
-- **Keyword Hints** — custom terms improve recognition of names and domain jargon
+- **Smart Post-Processing** — removes hallucinations, repetitions, filler words, and merges fragmented commas
+- **Custom Keywords** — manual keyword hints for domain-specific terms
 - **Window Detection** — auto-pastes if same window, shows Copy button if you switched
-- **Right-Click Menu** — switch ASR backend, microphone, edit keywords, view logs
+- **Right-Click Menu** — switch microphone, edit keywords, view logs
 - **Transcription History** — JSONL with 7-day retention
 - **Memory Management** — auto-cleanup and restart when memory gets high
 
@@ -27,120 +31,136 @@ Two ASR backends: [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/
 - **Apple Silicon** (M1 / M2 / M3 / M4)
 - **Python 3.10+**
 - **~1.5 GB** disk for Whisper model (downloaded on first run)
-- **~300 MB** additional for Paraformer model (optional, downloaded on first use)
+- **~400 MB** for LLM punctuation model (downloaded on first run)
 
 ## Installation
 
-### 1. Clone
+### Option A: Run from Source (recommended for development)
 
 ```bash
+# 1. Clone
 git clone https://github.com/jerryshimax/whisper-dictate.git
 cd whisper-dictate
-```
 
-### 2. Create environment & install
-
-```bash
+# 2. Create virtual environment & install dependencies
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Grant macOS permissions (see below)
+
+# 4. Run
+python -m whisper_dictate
 ```
 
-### 3. Build the macOS app
+### Option B: Build macOS .app
 
 ```bash
-.venv/bin/python setup_whisper_app.py
+# After cloning and installing dependencies:
+bash build_dmg.sh
 ```
 
-Creates `~/Applications/WhisperDictate.app`.
+This creates `~/Applications/WhisperDictate.app` — double-click to launch. No Python needed after build.
 
-### 4. macOS permissions
+### macOS Permissions
 
-1. **System Settings → Keyboard → "Press 🌐 key to"** → **Do Nothing**
-2. **System Settings → Privacy & Security → Accessibility** → Add WhisperDictate.app
-3. **System Settings → Privacy & Security → Microphone** → Allow WhisperDictate.app
-4. (Optional) **System Settings → General → Login Items** → Add for auto-start
+These are required for the app to work:
 
-### 5. Launch
+1. **System Settings > Privacy & Security > Accessibility** — add WhisperDictate (or Terminal if running from source)
+2. **System Settings > Privacy & Security > Microphone** — allow WhisperDictate (or Terminal)
+3. (Optional) **System Settings > General > Login Items** — add for auto-start
 
-```bash
-open ~/Applications/WhisperDictate.app
-```
+### First Launch
 
-First launch downloads the model (~1.5 GB). A small floating bar appears at the bottom of your screen when ready.
+First launch downloads the Whisper model (~1.5 GB) and LLM model (~400 MB). A small floating bar appears at the bottom of your screen. When it shows `○`, you're ready to go.
 
 ## Usage
 
-### Voice Input
+### Hold-to-Talk (default)
 
-1. **Hold Ctrl+Option** — bar expands with animated waveform
-2. **Speak** — any language, or mix Chinese and English freely
-3. **Release** — waveform shimmers while transcribing (~1-3s)
+1. **Hold Ctrl+Option** — bar expands with animated waveform, Tink sound plays
+2. **Speak** — any language, or mix Chinese and English
+3. **Release** — waveform shimmers while transcribing, Ping when done
 4. Text auto-pastes at your cursor
 
-If you switch windows while recording, a Copy button appears instead of auto-pasting.
+### Tap-to-Toggle (hands-free)
 
-### Switching ASR Backend
-
-Right-click the floating bar → **ASR Backend**:
-
-| Backend | Best For | Speed | Model Size |
-|---------|----------|-------|------------|
-| **Whisper (MLX)** | English, rare words, accents | ~1-3s | 1.5 GB |
-| **Paraformer (FunASR)** | Chinese, Chinese-English mix | ~0.5-1s | 300 MB |
-
-The new backend loads in the background — the bar shows a loading state, then you're good.
+1. **Quick tap Ctrl+Option** (< 0.6s) — recording starts, you hear Tink twice
+2. **Speak** — as long as you want, hands-free
+3. **Tap Ctrl+Option again** — stops recording, transcribes, Ping when done
 
 ### Keywords
 
-Edit `~/.config/whisper/keywords.txt` to improve recognition of specific terms:
+Edit `~/.config/whisper/keywords.txt` to add domain-specific terms:
 
 ```
-NVIDIA, Tesla, S&P 500, Bitcoin, your terms here
+# Natural sentences work best — Whisper follows style, not instructions
+Synergis Capital tracks ARR and valuation multiples for Series A deals.
+NVIDIA, Tesla, S&P 500, Bitcoin, your custom terms here.
 ```
 
-Changes apply on the next transcription, no restart needed.
+If you have an Obsidian vault at `~/Work/[00] Brain/`, WhisperDictate auto-scans it for people names, company names, and Chinese terms on startup.
 
 ### Right-Click Menu
 
+Right-click the floating bar:
 - **Edit Keywords** — open keyword file
 - **Open History** — view past transcriptions
 - **Open Log** — debug log
 - **Input Device** — switch microphone
-- **ASR Backend** — switch between Whisper and Paraformer
 - **Quit**
 
-### CLI Control
+### CLI
 
 ```bash
-./whisper_ctl.sh status    # Process info + memory
-./whisper_ctl.sh log       # Tail the log
-./whisper_ctl.sh mic       # List / switch microphones
-./whisper_ctl.sh restart   # Restart the app
-./whisper_ctl.sh quit      # Stop the app
+# Run from source
+pkill -f whisper_dictate
+cd ~/Ship/dictation && source .venv/bin/activate && python -m whisper_dictate &
+
+# Or run the app
+open ~/Applications/WhisperDictate.app
 ```
 
 ## Configuration
 
 | File | Purpose |
 |------|---------|
-| `~/.config/whisper/keywords.txt` | Keyword hints (comma-separated) |
-| `~/.config/whisper/config.json` | Settings (input device, etc.) |
+| `~/.config/whisper/keywords.txt` | Keyword hints for Whisper |
+| `~/.config/whisper/config.json` | Settings (input device, model) |
 | `~/.config/whisper/history.jsonl` | Transcription history (7-day retention) |
 | `~/.config/whisper/app.log` | Application log (5 MB rotation) |
 
 All config files are created with owner-only permissions (0600).
 
-## Acknowledgments
+## Architecture
 
-UI inspired by **[Typeless](https://typeless.so/)**.
+```
+whisper_dictate/
+├── app.py              # AppDelegate, main event loop
+├── asr.py              # Whisper MLX backend
+├── llm_polish.py       # Qwen2.5-0.5B punctuation fixer
+├── brain_keywords.py   # Obsidian vault keyword scanner
+├── postprocessor.py    # Regex text cleaning pipeline
+├── config.py           # Constants and config management
+├── audio.py            # Audio device and silence trimming
+├── clipboard.py        # Paste and clipboard restore
+├── history.py          # JSONL history and keyword mining
+├── event_tap.py        # CGEventTap hotkey detection
+├── macos.py            # Window detection, memory management
+├── logging_setup.py    # Rotating file logger
+└── ui/
+    ├── indicator.py    # Floating NSPanel bar
+    ├── waveform.py     # CALayer animated waveform
+    └── context_menu.py # Right-click menu
+```
 
-Built on:
+## Built With
+
 - [OpenAI Whisper](https://github.com/openai/whisper) — speech recognition model
 - [MLX](https://github.com/ml-explore/mlx) — Apple Silicon ML framework
-- [FunASR](https://github.com/modelscope/FunASR) — Alibaba DAMO speech recognition
-- [PyObjC](https://github.com/ronaldoussoren/pyobjc) — Python ↔ Cocoa bridge
+- [MLX-LM](https://github.com/ml-explore/mlx-examples/tree/main/llms) — local LLM inference
+- [PyObjC](https://github.com/ronaldoussoren/pyobjc) — Python-Cocoa bridge
 - [sounddevice](https://github.com/spatialaudio/python-sounddevice) / [PortAudio](http://www.portaudio.com/)
-- [NumPy](https://numpy.org/)
 
 ## License
 
