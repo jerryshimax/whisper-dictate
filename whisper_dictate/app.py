@@ -746,6 +746,10 @@ class AppDelegate(NSObject):
             else:
                 self.is_transcribing = False
                 if not self._last_text or self.label.stringValue().startswith("\u270e"):
+                    def _reset_waveform():
+                        self.waveform_view.set_state("idle")
+                        self.label.setHidden_(False)
+                    AppHelper.callAfter(_reset_waveform)
                     self._update_indicator(IDLE_LABEL, 0.1, 0.1, 0.1, 0.55)
 
     def _auto_restart(self):
