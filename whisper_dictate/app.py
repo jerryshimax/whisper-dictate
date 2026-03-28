@@ -24,6 +24,7 @@ from AppKit import (
     NSObject,
     NSPanel,
     NSScreen,
+    NSSound,
     NSTextField,
     NSWindowStyleMaskBorderless,
     NSBackingStoreBuffered,
@@ -406,6 +407,15 @@ class AppDelegate(NSObject):
             logger.info("Input device set to: system default")
         save_user_config(cfg)
 
+    # ── sound feedback ──
+    def _play_sound(self, name: str):
+        """Play a system sound by name (e.g. 'Tink', 'Pop')."""
+        def play():
+            sound = NSSound.soundNamed_(name)
+            if sound:
+                sound.play()
+        AppHelper.callAfter(play)
+
     # ── model warmup ──
     def _warmup(self):
         self._update_indicator(LOADING_LABEL, 0.1, 0.1, 0.1, 0.55)
@@ -465,6 +475,7 @@ class AppDelegate(NSObject):
             callback=audio_callback,
         )
         self.stream.start()
+        self._play_sound("Tink")
         logger.info("Recording...")
 
         if self._recording_timeout:
@@ -642,9 +653,11 @@ class AppDelegate(NSObject):
                 if same_app and not window_title_changed:
                     paste_text(processed)
                     t_end = time.monotonic()
+                    self._play_sound("Ping")
                     self._show_result(processed)
                 else:
                     t_end = time.monotonic()
+                    self._play_sound("Ping")
                     self._show_copy_prompt(processed)
                     logger.info(
                         "Window changed (app: %s -> %s, window: %r -> %r), showing copy prompt.",

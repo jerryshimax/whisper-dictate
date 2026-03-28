@@ -164,6 +164,47 @@ def _remove_fillers(text: str) -> str:
     return text
 
 
+def _merge_short_comma_fragments(text: str) -> str:
+    """Merge very short comma-separated fragments into natural sentences.
+
+    Whisper often inserts commas in odd places, splitting a single thought
+    into tiny fragments like "I think, that, we should". This merges
+    fragments shorter than ~4 words back together.
+    """
+    # Handle both English and Chinese commas
+    parts = re.split(r'([，,])', text)
+    if len(parts) <= 2:
+        return text
+
+    # Group into (fragment, separator) pairs
+    fragments: list[str] = []
+    separators: list[str] = []
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            fragments.append(part.strip())
+        else:
+            separators.append(part)
+
+    if not fragments:
+        return text
+
+    result_parts: list[str] = [fragments[0]]
+    for i, sep in enumerate(separators):
+        frag = fragments[i + 1] if i + 1 < len(fragments) else ""
+        # Count words in the fragment BEFORE this comma
+        prev_words = len(re.findall(r'[A-Za-z]+|[\u4e00-\u9fff]', result_parts[-1]))
+        next_words = len(re.findall(r'[A-Za-z]+|[\u4e00-\u9fff]', frag))
+        if prev_words <= 3 or next_words <= 2:
+            # Too short — merge by replacing comma with space
+            result_parts[-1] = result_parts[-1] + " " + frag
+        else:
+            result_parts[-1] = result_parts[-1] + sep + " " + frag
+
+    result = " ".join(result_parts) if len(result_parts) > 1 else result_parts[0]
+    result = re.sub(r'  +', ' ', result)
+    return result.strip()
+
+
 def _clean_whitespace(text: str) -> str:
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'([，,。.！!？?])\1+', r'\1', text)
@@ -179,6 +220,7 @@ def _postprocess_regex(text: str) -> str:
     text = _dedupe_tail_by_char_stream(text)
     text = _remove_fillers(text)
     text = _strip_tail_noise(text)
+    text = _merge_short_comma_fragments(text)
     text = _clean_whitespace(text)
     return text
 

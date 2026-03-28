@@ -42,7 +42,11 @@ def transcribe(
     t_asr = time.monotonic()
 
     import mlx_whisper
-    kwargs = {"path_or_hf_repo": WHISPER_MODEL}
+    kwargs = {
+        "path_or_hf_repo": WHISPER_MODEL,
+        "condition_on_previous_text": False,  # faster: no cross-segment context
+        "word_timestamps": False,             # faster: skip alignment pass
+    }
     if use_prompt and keywords:
         kwargs["initial_prompt"] = keywords
     result = mlx_whisper.transcribe(audio_path, **kwargs)

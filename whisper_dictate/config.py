@@ -131,14 +131,28 @@ def save_user_config(cfg: dict) -> None:
 
 # ── keywords ───────────────────────────────────────────────
 def load_keywords() -> str:
-    """Read keywords.txt as natural-language prompt text.
+    """Read keywords.txt + Brain vault terms as prompt text for Whisper.
 
-    Sentences are joined with spaces (not commas) to preserve natural
-    language structure, which Whisper's decoder uses more effectively
-    than bare keyword lists.
+    Combines manual keywords from keywords.txt with auto-scanned terms
+    from Brain vault (people names, company names, etc.).
     """
+    parts: list[str] = []
+
+    # 1. Manual keywords from keywords.txt
     if os.path.exists(KEYWORDS_FILE):
         with open(KEYWORDS_FILE, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-            return " ".join(lines)
-    return ""
+            manual = " ".join(lines)
+            if manual:
+                parts.append(manual)
+
+    # 2. Auto-scanned Brain vault keywords
+    try:
+        from whisper_dictate.brain_keywords import scan_brain_keywords
+        brain_kw = scan_brain_keywords(max_chars=500)
+        if brain_kw:
+            parts.append(brain_kw)
+    except Exception:
+        logger.debug("Brain keyword scan failed", exc_info=True)
+
+    return ", ".join(parts) if parts else ""
