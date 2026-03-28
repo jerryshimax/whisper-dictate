@@ -41,6 +41,7 @@ from whisper_dictate.config import (
     COPY_READY_LABEL,
     DONE_LABEL,
     FN_MIN_HOLD_SEC,
+    TAP_MAX_HOLD_SEC,
     HISTORY_FILE,
     IDLE_LABEL,
     INDICATOR_BOTTOM_MARGIN,
@@ -86,6 +87,7 @@ from whisper_dictate.macos import (
     _normalize_window_title,
 )
 from whisper_dictate.asr import warmup_model, transcribe
+from whisper_dictate.llm_polish import warmup_llm, polish_text
 from whisper_dictate.event_tap import setup_event_tap, EventTapState
 from whisper_dictate.ui.indicator import RoundedView
 from whisper_dictate.ui.waveform import WaveformView
@@ -118,6 +120,7 @@ class AppDelegate(NSObject):
         self._slow_asr_streak = 0
         self._disable_prompt_rounds = 0
         self._fn_press_time = 0.0
+        self._toggle_recording = False  # tap-to-toggle mode active
         self._asr_watchdog = None
         self._recording_timeout = None
         self.waveform_view = None
@@ -420,6 +423,7 @@ class AppDelegate(NSObject):
     def _warmup(self):
         self._update_indicator(LOADING_LABEL, 0.1, 0.1, 0.1, 0.55)
         warmup_model()
+        warmup_llm()  # pre-load punctuation LLM in background
         if self._event_tap_state.event_tap_failed:
             logger.warning("Model loaded, but event tap failed — keeping error indicator.")
             self._update_indicator("\u26a0\ufe0f  Need Accessibility", 0.5, 0.2, 0.1)
@@ -429,7 +433,15 @@ class AppDelegate(NSObject):
 
     # ── recording ──
     def _on_fn_press(self):
-        if self.is_recording or self.is_transcribing:
+        if self.is_transcribing:
+            return
+        # Second tap in toggle mode → stop recording
+        if self.is_recording and self._toggle_recording:
+            self._toggle_recording = False
+            self._fn_press_time = time.monotonic()  # reset so release is a no-op
+            self._stop_and_transcribe()
+            return
+        if self.is_recording:
             return
         self.is_recording = True
         self._fn_press_time = time.monotonic()
@@ -496,37 +508,18 @@ class AppDelegate(NSObject):
         self._recording_timeout.daemon = True
         self._recording_timeout.start()
 
-    def _on_fn_release(self):
-        if not self.is_recording:
-            return
+    def _stop_and_transcribe(self):
+        """Stop recording and kick off transcription (shared by hold and toggle)."""
         self.is_recording = False
-        hold_duration = time.monotonic() - self._fn_press_time
 
         if self._recording_timeout:
             self._recording_timeout.cancel()
             self._recording_timeout = None
 
-        # Move stream ref off self — background thread will stop/close it
         stream_ref = self.stream
         self.stream = None
 
-        if hold_duration < FN_MIN_HOLD_SEC:
-            # Ghost press (modifier key re-assertion) — discard silently
-            self.audio_chunks = []
-            if stream_ref:
-                def _close(s):
-                    try:
-                        s.stop()
-                        s.close()
-                    except Exception:
-                        logger.warning("Stream close error (ghost press)", exc_info=True)
-                threading.Thread(target=_close, args=(stream_ref,), daemon=True).start()
-            self._update_indicator(IDLE_LABEL, 0.1, 0.1, 0.1, 0.55)
-            return
-
-        # Normal release — stream stop + transcription all in background thread
         self.is_transcribing = True
-        # Switch waveform to shimmer animation for transcribing
         self.waveform_view.set_state("transcribing")
 
         if self._asr_watchdog:
@@ -547,6 +540,38 @@ class AppDelegate(NSObject):
         self._asr_watchdog.start()
 
         threading.Thread(target=self._transcribe, args=(stream_ref,), daemon=True).start()
+
+    def _on_fn_release(self):
+        if not self.is_recording:
+            return
+        hold_duration = time.monotonic() - self._fn_press_time
+
+        if hold_duration < FN_MIN_HOLD_SEC:
+            # Ghost press (modifier key re-assertion) — discard silently
+            self.is_recording = False
+            self.audio_chunks = []
+            stream_ref = self.stream
+            self.stream = None
+            if stream_ref:
+                def _close(s):
+                    try:
+                        s.stop()
+                        s.close()
+                    except Exception:
+                        logger.warning("Stream close error (ghost press)", exc_info=True)
+                threading.Thread(target=_close, args=(stream_ref,), daemon=True).start()
+            self._update_indicator(IDLE_LABEL, 0.1, 0.1, 0.1, 0.55)
+            return
+
+        if hold_duration < TAP_MAX_HOLD_SEC:
+            # Short tap → enter toggle mode, keep recording
+            self._toggle_recording = True
+            self._play_sound("Tink")  # double-Tink confirms toggle
+            logger.info("Toggle mode: recording continues (tap again to stop)")
+            return
+
+        # Long hold → stop and transcribe (hold-to-talk)
+        self._stop_and_transcribe()
 
     def _transcribe(self, stream_ref=None):
         # Stop/close audio stream in background thread (not blocking main RunLoop)
@@ -630,6 +655,10 @@ class AppDelegate(NSObject):
 
             if raw_text:
                 processed = postprocess_fast(raw_text)
+                polished, llm_sec = polish_text(processed)
+                if polished != processed:
+                    logger.info("llm  -> %s (%.2fs)", polished, llm_sec)
+                    processed = polished
                 t_post = time.monotonic()
                 logger.info("raw -> %s", raw_text)
                 logger.info("out -> %s", processed)
@@ -669,10 +698,10 @@ class AppDelegate(NSObject):
                 rss_mb_now = get_rss_mb()
                 kw_terms = len([x for x in self.keywords.split(",") if x.strip()]) if self.keywords else 0
                 logger.info(
-                    "[BENCH] audio=%.1fs | asr=%.2fs | rtf=%.2f | post=%.2fs | "
-                    "paste=%.2fs | total=%.2fs | rss=%.0fMB | kw_chars=%d | "
-                    "kw_terms=%d | prompt=%s | slow_streak=%d",
-                    duration, asr_sec, rtf, t_post - (t_start + asr_sec),
+                    "[BENCH] audio=%.1fs | asr=%.2fs | llm=%.2fs | rtf=%.2f | "
+                    "post=%.2fs | paste=%.2fs | total=%.2fs | rss=%.0fMB | "
+                    "kw_chars=%d | kw_terms=%d | prompt=%s | slow_streak=%d",
+                    duration, asr_sec, llm_sec, rtf, t_post - (t_start + asr_sec),
                     t_end - t_post, t_end - t_start, rss_mb_now, len(self.keywords),
                     kw_terms, "on" if use_prompt else "off", self._slow_asr_streak,
                 )

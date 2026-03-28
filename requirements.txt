@@ -1,4 +1,5 @@
 mlx-whisper
+mlx-lm
 pyobjc-framework-Cocoa
 pyobjc-framework-Quartz
 sounddevice
