@@ -88,11 +88,13 @@ def get_rss_mb() -> float:
 
 
 def run_memory_maintenance() -> None:
-    """Best-effort memory cleanup for long-running tray app."""
+    """Best-effort memory cleanup for long-running tray app.
+
+    Feature 6: More surgical — only run gc.collect(), do NOT clear MLX metal
+    cache. Clearing the cache forces model re-compilation on next inference,
+    adding 200-500ms latency. The RSS limit auto-restart handles true OOM.
+    """
     gc.collect()
-    try:
-        import mlx.core as mx  # type: ignore
-        if hasattr(mx, "clear_cache"):
-            mx.clear_cache()
-    except Exception:
-        pass
+    # Intentionally NOT clearing MLX cache here — keeping the metal cache hot
+    # means the next transcription starts instantly instead of recompiling.
+    # The auto-restart at MEMORY_SOFT_LIMIT_MB handles true memory pressure.
