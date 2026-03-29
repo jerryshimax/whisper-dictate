@@ -53,6 +53,7 @@ VAD_ENERGY_THRESHOLD_DB = -38.0     # dB above which we consider speech
 VAD_SILENCE_TRIGGER_SEC = 0.6       # silence duration to trigger segment boundary
 VAD_MIN_SEGMENT_SEC = 0.8           # minimum speech segment to transcribe
 VAD_FRAME_SEC = 0.03                # 30ms VAD frames
+VAD_MAX_SEGMENT_SEC = 3.0           # force segment boundary after this much continuous speech
 
 # ── LLM skip ─────────────────────────────────────────────
 LLM_SKIP_WORD_THRESHOLD = 8         # skip LLM polish for utterances <= this many words

@@ -430,8 +430,6 @@ class AppDelegate(NSObject):
         self._update_indicator(LOADING_LABEL, 0.1, 0.1, 0.1, 0.55)
         warmup_model()
         warmup_llm()  # pre-load punctuation LLM in background
-        # Warm fast model in background (non-blocking)
-        threading.Thread(target=warmup_fast_model, daemon=True).start()
         if self._event_tap_state.event_tap_failed:
             logger.warning("Model loaded, but event tap failed — keeping error indicator.")
             self._update_indicator("\u26a0\ufe0f  Need Accessibility", 0.5, 0.2, 0.1)
@@ -492,11 +490,10 @@ class AppDelegate(NSObject):
         AppHelper.callAfter(reset_and_record)
 
         def audio_callback(indata, frames, time_info, status):
-            chunk = indata.copy()
-            self.audio_chunks.append(chunk)
+            self.audio_chunks.append(indata.copy())
             # Feed streaming transcriber for VAD-chunked ASR
             if self._streamer:
-                self._streamer.feed(chunk)
+                self._streamer.feed(indata.copy())
             mono = indata[:, 0]
             rms = float(np.sqrt(np.mean(np.square(mono))))
             db = 20.0 * np.log10(max(rms, 1e-7))
@@ -657,6 +654,11 @@ class AppDelegate(NSObject):
         try:
             t_start = time.monotonic()
 
+            # Start window title fetch in parallel with ASR finalize
+            from concurrent.futures import ThreadPoolExecutor
+            _window_pool = ThreadPoolExecutor(max_workers=1)
+            window_future = _window_pool.submit(get_front_window_title)
+
             # ── Feature 1: Finalize streaming transcriber ──
             # The streamer has been transcribing speech segments in the background
             # during recording. Now we just need to process the tail.
@@ -669,13 +671,16 @@ class AppDelegate(NSObject):
 
             if streamer:
                 raw_text, asr_sec, duration = streamer.finalize()
+                logger.info("Streamer result: duration=%.2fs, text=%r, chunks=%d",
+                            duration, raw_text[:60] if raw_text else "", len(chunks))
 
-                if duration < MIN_AUDIO_DURATION_SEC:
-                    logger.info("Too short (%.2fs), skipping.", duration)
+                # If streaming got no audio, fall back to batch using audio_chunks
+                if duration < MIN_AUDIO_DURATION_SEC and not chunks:
+                    logger.info("Too short (%.2fs) and no chunks, skipping.", duration)
                     return
 
                 # If streaming produced nothing, fall back to batch transcription
-                if not raw_text and chunks:
+                if (not raw_text or duration < MIN_AUDIO_DURATION_SEC) and chunks:
                     logger.info("Streaming produced no text, falling back to batch.")
                     audio = np.concatenate(chunks, axis=0)
                     chunks.clear()
@@ -763,7 +768,11 @@ class AppDelegate(NSObject):
                 )
                 current_front_window = ""
                 if same_app:
-                    current_front_window = get_front_window_title()
+                    try:
+                        current_front_window = window_future.result(timeout=0.5)
+                    except Exception:
+                        current_front_window = ""
+                _window_pool.shutdown(wait=False)
                 window_title_changed = (
                     bool(self._recording_front_window)
                     and bool(current_front_window)
@@ -845,8 +854,7 @@ class AppDelegate(NSObject):
     def _paste_with_presnapshot(self, text: str) -> None:
         """Paste text using the clipboard snapshot captured at recording start.
 
-        Feature 5: Since we pre-captured the clipboard in _on_fn_press,
-        we skip the snapshot step here, saving ~50ms.
+        Uses native NSPasteboard + CGEvent instead of subprocess calls.
         """
         snapshot = self._clipboard_snapshot
         change_count = self._clipboard_change_count
@@ -854,28 +862,21 @@ class AppDelegate(NSObject):
         self._clipboard_change_count = None
 
         if snapshot is None or change_count is None:
-            # No pre-snapshot available, fall back to standard paste
             paste_text(text)
             return
 
-        from whisper_dictate.clipboard import _restore_clipboard
-
-        # Write text to clipboard and paste
-        proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        proc.communicate(text.encode("utf-8"))
-        subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to keystroke "v" using command down'],
-            capture_output=True,
+        from whisper_dictate.clipboard import (
+            _set_clipboard_text, _simulate_cmd_v, _restore_clipboard,
         )
-
-        # Restore original clipboard using pre-captured snapshot
         from whisper_dictate.config import CLIPBOARD_RESTORE_DELAY_SEC
+
+        _set_clipboard_text(text)
+        _simulate_cmd_v()
 
         def _restore():
             try:
-                pb = __import__('AppKit', fromlist=['NSPasteboard']).NSPasteboard.generalPasteboard()
-                current_count = int(pb.changeCount())
+                from AppKit import NSPasteboard as _NSPb
+                current_count = int(_NSPb.generalPasteboard().changeCount())
                 if current_count == change_count + 1:
                     _restore_clipboard(snapshot)
             except Exception:

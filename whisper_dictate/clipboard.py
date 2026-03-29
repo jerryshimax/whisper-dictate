@@ -1,16 +1,30 @@
-"""Clipboard snapshot, paste, and restore operations."""
+"""Clipboard snapshot, paste, and restore operations.
+
+Uses native macOS APIs (NSPasteboard + CGEvent) instead of subprocess
+calls (pbcopy/osascript) for dramatically lower latency.
+"""
 from __future__ import annotations
 
 import logging
-import subprocess
 import threading
+import time
 
-from AppKit import NSPasteboard, NSPasteboardItem
+from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
 from Foundation import NSData
+from Quartz import (
+    CGEventCreateKeyboardEvent,
+    CGEventSetFlags,
+    CGEventPost,
+    kCGHIDEventTap,
+    kCGEventFlagMaskCommand,
+)
 
 from whisper_dictate.config import CLIPBOARD_RESTORE_DELAY_SEC
 
 logger = logging.getLogger("whisper_dictate.clipboard")
+
+# macOS keycode for 'v'
+_V_KEYCODE = 9
 
 
 def _snapshot_clipboard() -> tuple[int, list[dict[str, bytes]]]:
@@ -50,6 +64,23 @@ def _restore_clipboard(snapshot: list[dict[str, bytes]]) -> None:
     pb.writeObjects_(restored_items)
 
 
+def _set_clipboard_text(text: str) -> None:
+    """Write text to clipboard via NSPasteboard (no subprocess)."""
+    pb = NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    pb.setString_forType_(text, NSPasteboardTypeString)
+
+
+def _simulate_cmd_v() -> None:
+    """Simulate Cmd+V keystroke via CGEvent (no osascript subprocess)."""
+    event_down = CGEventCreateKeyboardEvent(None, _V_KEYCODE, True)
+    CGEventSetFlags(event_down, kCGEventFlagMaskCommand)
+    event_up = CGEventCreateKeyboardEvent(None, _V_KEYCODE, False)
+    CGEventSetFlags(event_up, kCGEventFlagMaskCommand)
+    CGEventPost(kCGHIDEventTap, event_down)
+    CGEventPost(kCGHIDEventTap, event_up)
+
+
 def paste_text(text: str) -> None:
     """Copy text to clipboard, paste via Cmd+V, then restore original clipboard."""
     snapshot = None
@@ -59,13 +90,10 @@ def paste_text(text: str) -> None:
     except Exception:
         logger.warning("Clipboard snapshot failed", exc_info=True)
 
-    proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-    proc.communicate(text.encode("utf-8"))
-    subprocess.run(
-        ["osascript", "-e",
-         'tell application "System Events" to keystroke "v" using command down'],
-        capture_output=True,
-    )
+    t0 = time.monotonic()
+    _set_clipboard_text(text)
+    _simulate_cmd_v()
+    logger.debug("Native paste: %.1fms", (time.monotonic() - t0) * 1000)
 
     if snapshot is None or previous_change_count is None:
         return
@@ -75,7 +103,6 @@ def paste_text(text: str) -> None:
             pb = NSPasteboard.generalPasteboard()
             expected = previous_change_count + 1
             if pb.changeCount() != expected:
-                # User/app changed clipboard after paste; do not overwrite.
                 return
             _restore_clipboard(snapshot)
         except Exception:

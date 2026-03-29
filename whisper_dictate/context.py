@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import logging
 import re
-import subprocess
 
 from whisper_dictate.config import CONTEXT_APPS
+from whisper_dictate.macos import get_front_window_title
 
 logger = logging.getLogger("whisper_dictate.context")
 
@@ -23,30 +23,7 @@ def get_window_context_keywords(bundle_id: str) -> str:
     Slack channel names, document titles).
     """
     app_type = get_app_type(bundle_id)
-
-    # Get the window title
-    try:
-        script = (
-            'tell application "System Events"\n'
-            '  try\n'
-            '    set frontProc to first process whose frontmost is true\n'
-            '    set wt to ""\n'
-            '    try\n'
-            '      set wt to name of front window of frontProc\n'
-            '    end try\n'
-            '    return wt\n'
-            '  on error\n'
-            '    return ""\n'
-            '  end try\n'
-            'end tell'
-        )
-        out = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=0.3,
-        )
-        title = out.stdout.strip() if out.returncode == 0 else ""
-    except Exception:
-        title = ""
+    title = get_front_window_title()
 
     if not title:
         return ""

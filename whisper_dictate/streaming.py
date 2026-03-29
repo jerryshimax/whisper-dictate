@@ -24,6 +24,7 @@ from whisper_dictate.config import (
     SAMPLE_RATE,
     VAD_ENERGY_THRESHOLD_DB,
     VAD_FRAME_SEC,
+    VAD_MAX_SEGMENT_SEC,
     VAD_MIN_SEGMENT_SEC,
     VAD_SILENCE_TRIGGER_SEC,
 )
@@ -40,12 +41,6 @@ class StreamingTranscriber:
         self._use_prompt = use_prompt
         self._kw_lock = threading.Lock()
 
-    def update_keywords(self, keywords: str, use_prompt: bool = True) -> None:
-        """Update keywords after construction (called when background context is ready)."""
-        with self._kw_lock:
-            self._keywords = keywords
-            self._use_prompt = use_prompt
-
         # Audio accumulation
         self._frame_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._all_audio: list[np.ndarray] = []  # all frames in order
@@ -57,6 +52,7 @@ class StreamingTranscriber:
         self._silence_samples: int = 0
         self._silence_trigger = int(SAMPLE_RATE * VAD_SILENCE_TRIGGER_SEC)
         self._min_segment_samples = int(SAMPLE_RATE * VAD_MIN_SEGMENT_SEC)
+        self._max_segment_samples = int(SAMPLE_RATE * VAD_MAX_SEGMENT_SEC)
         self._vad_frame_size = int(SAMPLE_RATE * VAD_FRAME_SEC)
 
         # Results
@@ -69,16 +65,25 @@ class StreamingTranscriber:
         self._running = False
         self._vad_thread: threading.Thread | None = None
 
+    def update_keywords(self, keywords: str, use_prompt: bool = True) -> None:
+        """Update keywords after construction (called when background context is ready)."""
+        with self._kw_lock:
+            self._keywords = keywords
+            self._use_prompt = use_prompt
+
     def start(self) -> None:
         """Start the VAD processing thread."""
         self._running = True
         self._vad_thread = threading.Thread(target=self._vad_loop, daemon=True)
         self._vad_thread.start()
+        logger.info("StreamingTranscriber started (running=%s)", self._running)
 
     def feed(self, audio_chunk: np.ndarray) -> None:
         """Called from the audio callback with each chunk of samples."""
         if self._running:
             self._frame_queue.put(audio_chunk.copy())
+        else:
+            logger.debug("feed() called but streamer not running (samples=%d)", len(audio_chunk))
 
     def finalize(self) -> tuple[str, float, float]:
         """Stop streaming, transcribe any remaining audio, return full result.
@@ -86,12 +91,19 @@ class StreamingTranscriber:
         Returns (full_text, total_asr_seconds, audio_duration).
         """
         t0 = time.monotonic()
+        qsize = self._frame_queue.qsize()
+        logger.info("finalize() called: queue_size=%d, total_samples_so_far=%d", qsize, self._total_samples)
         self._running = False
         self._frame_queue.put(None)  # sentinel
 
         # Wait for VAD thread to finish processing
         if self._vad_thread:
             self._vad_thread.join(timeout=2.0)
+
+        # Wait for in-flight ASR threads BEFORE transcribing the tail —
+        # MLX Metal can't run concurrent Whisper inference without deadlocking.
+        for t in self._asr_threads:
+            t.join(timeout=10.0)
 
         # Transcribe any remaining audio that didn't hit a silence boundary
         remaining = self._get_remaining_audio()
@@ -104,10 +116,6 @@ class StreamingTranscriber:
             if text:
                 with self._result_lock:
                     self._results.append((seg_idx, text))
-
-        # Wait for any in-flight ASR threads
-        for t in self._asr_threads:
-            t.join(timeout=10.0)
 
         # Assemble final text in segment order
         with self._result_lock:
