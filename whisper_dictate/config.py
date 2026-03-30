@@ -49,9 +49,9 @@ TRAILING_SILENCE_HOLD_SEC = 0.28
 TRAILING_SILENCE_DB_THRESHOLD = -42.0
 
 # ── streaming VAD ─────────────────────────────────────────
-VAD_ENERGY_THRESHOLD_DB = -38.0     # dB above which we consider speech
-VAD_SILENCE_TRIGGER_SEC = 0.6       # silence duration to trigger segment boundary
-VAD_MIN_SEGMENT_SEC = 0.8           # minimum speech segment to transcribe
+VAD_ENERGY_THRESHOLD_DB = -42.0     # dB above which we consider speech (lower = more sensitive)
+VAD_SILENCE_TRIGGER_SEC = 0.45      # silence duration to trigger segment boundary
+VAD_MIN_SEGMENT_SEC = 0.5           # minimum speech segment to transcribe
 VAD_FRAME_SEC = 0.03                # 30ms VAD frames
 VAD_MAX_SEGMENT_SEC = 3.0           # force segment boundary after this much continuous speech
 

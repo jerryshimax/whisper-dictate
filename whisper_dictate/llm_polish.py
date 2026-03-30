@@ -93,12 +93,14 @@ def polish_text(text: str) -> tuple[str, float]:
                 return  # LLM output too short, reject
             if len(cleaned) > len(text) * 2.0:
                 return  # LLM added too much, reject
-            # Verify words weren't changed: compare alphanumeric content
+            # Verify words weren't changed: compare actual words, not just count
             import re
             orig_words = re.findall(r'[a-zA-Z]+|[\u4e00-\u9fff]', text.lower())
             new_words = re.findall(r'[a-zA-Z]+|[\u4e00-\u9fff]', cleaned.lower())
-            if orig_words == new_words or len(new_words) >= len(orig_words) * 0.85:
+            if orig_words == new_words:
                 result[0] = cleaned
+            else:
+                logger.debug("LLM changed words, rejecting: %r -> %r", orig_words[:5], new_words[:5])
         except Exception:
             logger.debug("LLM polish failed", exc_info=True)
 

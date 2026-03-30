@@ -463,7 +463,10 @@ class AppDelegate(NSObject):
         # Get app ID via NSWorkspace (instant, no subprocess)
         self._recording_front_app = get_frontmost_app_id()
 
-        # Start streaming transcriber with no keywords (updated by background thread)
+        # Start streaming transcriber with empty keywords — background thread
+        # will call load_keywords() (which may do slow Brain vault I/O) and
+        # update via streamer.update_keywords(). Never call load_keywords()
+        # on the hotkey/CGEventTap thread — it can block and kill the tap.
         self._streamer = StreamingTranscriber(keywords="", use_prompt=False)
         self._streamer.start()
 

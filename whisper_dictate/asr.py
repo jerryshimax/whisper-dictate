@@ -79,7 +79,7 @@ def transcribe(
     import mlx_whisper
     kwargs = {
         "path_or_hf_repo": model,
-        "condition_on_previous_text": False,  # faster: no cross-segment context
+        "condition_on_previous_text": True,   # enable cross-segment context for accuracy
         "word_timestamps": False,             # faster: skip alignment pass
     }
     if use_prompt and keywords:

@@ -179,6 +179,23 @@ class StreamingTranscriber:
             else:
                 pending_frames = []
 
+    def _dispatch_segment(self, segment_end: int) -> None:
+        """Extract and dispatch a speech segment for transcription."""
+        segment_samples = segment_end - self._segment_start
+        if segment_samples >= self._min_segment_samples:
+            segment_audio = self._extract_segment(self._segment_start, segment_end)
+            if segment_audio is not None:
+                seg_idx = self._segment_count
+                self._segment_count += 1
+                t = threading.Thread(
+                    target=self._transcribe_and_store,
+                    args=(segment_audio, seg_idx),
+                    daemon=True,
+                )
+                self._asr_threads.append(t)
+                t.start()
+        self._segment_start = segment_end
+
     def _process_vad_frame(self, frame: np.ndarray) -> None:
         """Process a single VAD frame, detect speech/silence transitions."""
         rms = float(np.sqrt(np.mean(np.square(frame))))
@@ -189,6 +206,16 @@ class StreamingTranscriber:
         if is_speech:
             self._speech_active = True
             self._silence_samples = 0
+
+            # Enforce max segment duration — force a boundary for long continuous speech
+            current_segment_samples = self._total_samples - self._segment_start
+            if current_segment_samples >= self._max_segment_samples:
+                # Use the start of the current frame as boundary, not _total_samples
+                # which points past it — avoids overlap with the next segment
+                segment_end = self._total_samples - len(frame)
+                logger.debug("Max segment boundary at %.1fs", segment_end / SAMPLE_RATE)
+                self._dispatch_segment(segment_end)
+                # Stay in speech_active state — don't reset, next frame continues new segment
         else:
             if self._speech_active:
                 self._silence_samples += len(frame)
@@ -196,24 +223,7 @@ class StreamingTranscriber:
                 if self._silence_samples >= self._silence_trigger:
                     # Silence boundary detected — extract and transcribe segment
                     segment_end = self._total_samples - self._silence_samples
-                    segment_samples = segment_end - self._segment_start
-
-                    if segment_samples >= self._min_segment_samples:
-                        segment_audio = self._extract_segment(
-                            self._segment_start, segment_end
-                        )
-                        if segment_audio is not None:
-                            seg_idx = self._segment_count
-                            self._segment_count += 1
-                            t = threading.Thread(
-                                target=self._transcribe_and_store,
-                                args=(segment_audio, seg_idx),
-                                daemon=True,
-                            )
-                            self._asr_threads.append(t)
-                            t.start()
-
-                    self._segment_start = segment_end
+                    self._dispatch_segment(segment_end)
                     self._speech_active = False
                     self._silence_samples = 0
 
