@@ -225,9 +225,18 @@ def _postprocess_regex(text: str) -> str:
     return text
 
 
+def _t2s(text: str) -> str:
+    """Convert traditional Chinese to simplified using macOS ICU (zero dependencies)."""
+    from Foundation import NSString
+    ns = NSString.stringWithString_(text)
+    result = ns.stringByApplyingTransform_reverse_('Hant-Hans', False)
+    return str(result) if result else text
+
+
 def postprocess_fast(text: str) -> str:
-    """Immediate path: hallucination strip + regex. Always returns quickly."""
+    """Immediate path: hallucination strip + regex + t2s. Always returns quickly."""
     text = _strip_hallucinations(text)
     if not text:
         return text
-    return _postprocess_regex(text)
+    text = _postprocess_regex(text)
+    return _t2s(text)

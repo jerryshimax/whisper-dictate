@@ -60,6 +60,8 @@ class StreamingTranscriber:
         self._result_lock = threading.Lock()
         self._segment_count = 0
         self._asr_threads: list[threading.Thread] = []
+        self._total_asr_sec = 0.0  # accumulated ASR time across all segments
+        self._asr_lock = threading.Lock()  # serialize MLX inference — Metal crashes on concurrent GPU ops
 
         # Control
         self._running = False
@@ -105,13 +107,30 @@ class StreamingTranscriber:
         for t in self._asr_threads:
             t.join(timeout=10.0)
 
-        # Transcribe any remaining audio that didn't hit a silence boundary
+        # Transcribe any remaining audio that didn't hit a silence boundary.
+        # Must hold _asr_lock: join(timeout=10) above can expire before a
+        # _transcribe_and_store thread finishes, leaving concurrent MLX ops.
+        # For short tails after segments: check energy to avoid sending silence
+        # to Whisper (which causes hallucinations like "Nu Nu Nu...").
         remaining = self._get_remaining_audio()
         remaining_asr_sec = 0.0
-        if remaining is not None and len(remaining) >= self._min_segment_samples:
+        skip_tail = False
+        if remaining is not None and self._segment_count > 0 and len(remaining) < int(SAMPLE_RATE * 2.0):
+            # Short tail after pre-transcribed segments — check if it has speech
+            rms = float(np.sqrt(np.mean(np.square(remaining))))
+            db = 20.0 * np.log10(max(rms, 1e-7))
+            if db < VAD_ENERGY_THRESHOLD_DB:
+                logger.info("Skipping short tail (%.1fs, %.1fdB) — below speech threshold",
+                            len(remaining) / SAMPLE_RATE, db)
+                skip_tail = True
+            else:
+                logger.info("Short tail has speech energy (%.1fs, %.1fdB) — transcribing",
+                            len(remaining) / SAMPLE_RATE, db)
+        if remaining is not None and len(remaining) >= self._min_segment_samples and not skip_tail:
             seg_idx = self._segment_count
             self._segment_count += 1
-            text, asr_sec = self._transcribe_segment(remaining)
+            with self._asr_lock:
+                text, asr_sec = self._transcribe_segment(remaining)
             remaining_asr_sec = asr_sec
             if text:
                 with self._result_lock:
@@ -126,7 +145,8 @@ class StreamingTranscriber:
         total_duration = self._total_samples / SAMPLE_RATE
         total_time = time.monotonic() - t0
 
-        pre_transcribed = len(self._results) - (1 if remaining is not None and len(remaining) >= self._min_segment_samples else 0)
+        tail_was_transcribed = remaining is not None and len(remaining) >= self._min_segment_samples and not skip_tail
+        pre_transcribed = len(self._results) - (1 if tail_was_transcribed else 0)
         logger.info(
             "Streaming finalize: %d segments pre-transcribed, tail=%.1fs, "
             "finalize_time=%.2fs, total_audio=%.1fs",
@@ -136,7 +156,8 @@ class StreamingTranscriber:
             total_duration,
         )
 
-        return full_text, remaining_asr_sec, total_duration
+        total_asr_sec = self._total_asr_sec + remaining_asr_sec
+        return full_text, total_asr_sec, total_duration
 
     def get_all_audio(self) -> np.ndarray | None:
         """Return all accumulated audio as a single array (for fallback)."""
@@ -203,19 +224,23 @@ class StreamingTranscriber:
 
         is_speech = db > VAD_ENERGY_THRESHOLD_DB
 
+        # Enforce max segment duration — fires regardless of current frame's
+        # speech/silence state, but only if we've seen speech in this segment.
+        # Without the speech_active guard, pure silence/noise would be dispatched
+        # to Whisper and cause hallucinated text.
+        if self._speech_active or is_speech:
+            current_segment_samples = self._total_samples - self._segment_start
+            if current_segment_samples >= self._max_segment_samples:
+                segment_end = self._total_samples - len(frame)
+                if segment_end > self._segment_start:
+                    logger.debug("Max segment boundary at %.1fs (speech=%s)",
+                                 segment_end / SAMPLE_RATE, self._speech_active)
+                    self._dispatch_segment(segment_end)
+                    self._silence_samples = 0
+
         if is_speech:
             self._speech_active = True
             self._silence_samples = 0
-
-            # Enforce max segment duration — force a boundary for long continuous speech
-            current_segment_samples = self._total_samples - self._segment_start
-            if current_segment_samples >= self._max_segment_samples:
-                # Use the start of the current frame as boundary, not _total_samples
-                # which points past it — avoids overlap with the next segment
-                segment_end = self._total_samples - len(frame)
-                logger.debug("Max segment boundary at %.1fs", segment_end / SAMPLE_RATE)
-                self._dispatch_segment(segment_end)
-                # Stay in speech_active state — don't reset, next frame continues new segment
         else:
             if self._speech_active:
                 self._silence_samples += len(frame)
@@ -260,7 +285,9 @@ class StreamingTranscriber:
     def _transcribe_and_store(self, audio: np.ndarray, seg_idx: int) -> None:
         """Transcribe and store result (runs in background thread)."""
         try:
-            text, asr_sec = self._transcribe_segment(audio)
+            with self._asr_lock:  # MLX Metal segfaults on concurrent GPU inference
+                text, asr_sec = self._transcribe_segment(audio)
+            self._total_asr_sec += asr_sec
             dur = len(audio) / SAMPLE_RATE
             logger.info(
                 "Streaming segment #%d: %.1fs audio -> %.2fs ASR, text=%r",

@@ -34,9 +34,6 @@ from Quartz import kCGFloatingWindowLevel
 from PyObjCTools import AppHelper
 
 from whisper_dictate.config import (
-    ASR_SLOW_RTF_THRESHOLD,
-    ASR_SLOW_STREAK_TRIGGER,
-    ASR_SLOW_THRESHOLD_SEC,
     ASR_WATCHDOG_SEC,
     COPY_READY_LABEL,
     DONE_LABEL,
@@ -54,7 +51,6 @@ from whisper_dictate.config import (
     INDICATOR_WIDTH_RESULT,
     KEYWORDS_FILE,
     KEYWORDS_MAX_CHARS,
-    LLM_SKIP_WORD_THRESHOLD,
     LOADING_LABEL,
     LOG_FILE,
     MEMORY_MAINTENANCE_INTERVAL_SEC,
@@ -63,7 +59,6 @@ from whisper_dictate.config import (
     METER_MIN_DB,
     METER_UPDATE_INTERVAL_SEC,
     MIN_AUDIO_DURATION_SEC,
-    PROMPT_DISABLE_ROUNDS_ON_SLOW,
     RECORDING_TIMEOUT_SEC,
     RESULT_DISPLAY_SECONDS,
     SAMPLE_RATE,
@@ -87,10 +82,9 @@ from whisper_dictate.macos import (
     run_memory_maintenance,
     _normalize_window_title,
 )
-from whisper_dictate.asr import warmup_model, warmup_fast_model, transcribe
+from whisper_dictate.asr import warmup_model, transcribe
 from whisper_dictate.llm_polish import warmup_llm, polish_text
 from whisper_dictate.event_tap import setup_event_tap, EventTapState
-from whisper_dictate.streaming import StreamingTranscriber
 from whisper_dictate.context import get_window_context_keywords
 from whisper_dictate.ui.indicator import RoundedView
 from whisper_dictate.ui.waveform import WaveformView
@@ -120,8 +114,6 @@ class AppDelegate(NSObject):
         self._recording_front_window = ""
         self._pending_copy_text = ""
         self._last_memory_maintenance_ts = 0.0
-        self._slow_asr_streak = 0
-        self._disable_prompt_rounds = 0
         self._fn_press_time = 0.0
         self._toggle_recording = False  # tap-to-toggle mode active
         self._asr_watchdog = None
@@ -129,7 +121,6 @@ class AppDelegate(NSObject):
         self.waveform_view = None
         self._mic_submenu = None
         self._event_tap_state = EventTapState()
-        self._streamer = None  # StreamingTranscriber instance during recording
         self._clipboard_snapshot = None  # pre-captured clipboard for parallel paste
         self._clipboard_change_count = None
         return self
@@ -429,7 +420,7 @@ class AppDelegate(NSObject):
     def _warmup(self):
         self._update_indicator(LOADING_LABEL, 0.1, 0.1, 0.1, 0.55)
         warmup_model()
-        warmup_llm()  # pre-load punctuation LLM in background
+        warmup_llm()
         if self._event_tap_state.event_tap_failed:
             logger.warning("Model loaded, but event tap failed — keeping error indicator.")
             self._update_indicator("\u26a0\ufe0f  Need Accessibility", 0.5, 0.2, 0.1)
@@ -463,13 +454,6 @@ class AppDelegate(NSObject):
         # Get app ID via NSWorkspace (instant, no subprocess)
         self._recording_front_app = get_frontmost_app_id()
 
-        # Start streaming transcriber with empty keywords — background thread
-        # will call load_keywords() (which may do slow Brain vault I/O) and
-        # update via streamer.update_keywords(). Never call load_keywords()
-        # on the hotkey/CGEventTap thread — it can block and kill the tap.
-        self._streamer = StreamingTranscriber(keywords="", use_prompt=False)
-        self._streamer.start()
-
         if self._hide_timer:
             self._hide_timer.cancel()
             self._hide_timer = None
@@ -494,9 +478,6 @@ class AppDelegate(NSObject):
 
         def audio_callback(indata, frames, time_info, status):
             self.audio_chunks.append(indata.copy())
-            # Feed streaming transcriber for VAD-chunked ASR
-            if self._streamer:
-                self._streamer.feed(indata.copy())
             mono = indata[:, 0]
             rms = float(np.sqrt(np.mean(np.square(mono))))
             db = 20.0 * np.log10(max(rms, 1e-7))
@@ -544,12 +525,6 @@ class AppDelegate(NSObject):
                 if len(combined) <= KEYWORDS_MAX_CHARS:
                     self.keywords = combined
                     logger.info("Context keywords appended: %s", context_kw)
-
-            use_prompt = bool(self.keywords) and self._disable_prompt_rounds <= 0
-
-            # Update the already-running streamer with keywords
-            if self._streamer and use_prompt:
-                self._streamer.update_keywords(self.keywords, use_prompt=True)
 
             logger.info("Background context gathered in %.0fms", (time.monotonic() - t0) * 1000)
 
@@ -662,102 +637,43 @@ class AppDelegate(NSObject):
             _window_pool = ThreadPoolExecutor(max_workers=1)
             window_future = _window_pool.submit(get_front_window_title)
 
-            # ── Feature 1: Finalize streaming transcriber ──
-            # The streamer has been transcribing speech segments in the background
-            # during recording. Now we just need to process the tail.
-            streamer = self._streamer
-            self._streamer = None
-
-            # Also grab the old-style chunks as fallback
+            # ── Grab recorded audio and transcribe ──
             chunks = self.audio_chunks
             self.audio_chunks = []
 
-            if streamer:
-                raw_text, asr_sec, duration = streamer.finalize()
-                logger.info("Streamer result: duration=%.2fs, text=%r, chunks=%d",
-                            duration, raw_text[:60] if raw_text else "", len(chunks))
+            if not chunks:
+                logger.info("No audio captured.")
+                return
+            audio = np.concatenate(chunks, axis=0)
+            chunks.clear()
+            audio, _ = _trim_trailing_silence(audio)
+            duration = len(audio) / SAMPLE_RATE
+            if duration < MIN_AUDIO_DURATION_SEC:
+                logger.info("Too short (%.2fs), skipping.", duration)
+                return
 
-                # If streaming got no audio, fall back to batch using audio_chunks
-                if duration < MIN_AUDIO_DURATION_SEC and not chunks:
-                    logger.info("Too short (%.2fs) and no chunks, skipping.", duration)
-                    return
-
-                # If streaming produced nothing, fall back to batch transcription
-                if (not raw_text or duration < MIN_AUDIO_DURATION_SEC) and chunks:
-                    logger.info("Streaming produced no text, falling back to batch.")
-                    audio = np.concatenate(chunks, axis=0)
-                    chunks.clear()
-                    audio, trimmed_tail_sec = _trim_trailing_silence(audio)
-                    duration = len(audio) / SAMPLE_RATE
-                    if duration < MIN_AUDIO_DURATION_SEC:
-                        logger.info("Batch fallback too short (%.2fs), skipping.", duration)
-                        return
-                    tmp = _secure_tmpfile()
-                    sf.write(tmp, audio, SAMPLE_RATE)
-
-                    use_prompt = bool(self.keywords) and self._disable_prompt_rounds <= 0
-                    if not use_prompt and self._disable_prompt_rounds > 0:
-                        self._disable_prompt_rounds -= 1
-
-                    raw_text, asr_sec = transcribe(
-                        audio_path=tmp,
-                        keywords=self.keywords,
-                        use_prompt=use_prompt,
-                        duration=duration,
-                    )
-                    os.unlink(tmp)
-            else:
-                # No streamer (shouldn't happen, but handle gracefully)
-                if not chunks:
-                    logger.info("No audio captured.")
-                    return
-                audio = np.concatenate(chunks, axis=0)
-                chunks.clear()
-                audio, _ = _trim_trailing_silence(audio)
-                duration = len(audio) / SAMPLE_RATE
-                if duration < MIN_AUDIO_DURATION_SEC:
-                    return
-                tmp = _secure_tmpfile()
-                sf.write(tmp, audio, SAMPLE_RATE)
-                use_prompt = bool(self.keywords) and self._disable_prompt_rounds <= 0
+            tmp = _secure_tmpfile()
+            sf.write(tmp, audio, SAMPLE_RATE)
+            try:
+                use_prompt = bool(self.keywords)
                 raw_text, asr_sec = transcribe(
                     audio_path=tmp, keywords=self.keywords,
                     use_prompt=use_prompt, duration=duration,
                 )
-                os.unlink(tmp)
-
-            # Track slow ASR
-            rtf = asr_sec / max(duration, 0.1)
-            slow_asr = asr_sec >= ASR_SLOW_THRESHOLD_SEC or rtf >= ASR_SLOW_RTF_THRESHOLD
-            if slow_asr:
-                self._slow_asr_streak += 1
-            else:
-                self._slow_asr_streak = 0
-            if self._slow_asr_streak >= ASR_SLOW_STREAK_TRIGGER:
-                self._disable_prompt_rounds = max(
-                    self._disable_prompt_rounds, PROMPT_DISABLE_ROUNDS_ON_SLOW
-                )
-                logger.info(
-                    "Slow ASR streak=%d, disable prompt for next %d rounds. (asr=%.2fs, rtf=%.2f)",
-                    self._slow_asr_streak, self._disable_prompt_rounds, asr_sec, rtf,
-                )
-            elif self._disable_prompt_rounds > 0:
-                self._disable_prompt_rounds -= 1
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
             if raw_text:
                 processed = postprocess_fast(raw_text)
 
-                # ── Feature 3: Skip LLM polish on short utterances ──
-                import re
-                word_count = len(re.findall(r'[A-Za-z]+|[\u4e00-\u9fff]', processed))
-                llm_sec = 0.0
-                if word_count > LLM_SKIP_WORD_THRESHOLD:
-                    polished, llm_sec = polish_text(processed)
-                    if polished != processed:
-                        logger.info("llm  -> %s (%.2fs)", polished, llm_sec)
-                        processed = polished
-                else:
-                    logger.info("LLM skip: %d words <= threshold %d", word_count, LLM_SKIP_WORD_THRESHOLD)
+                # LLM punctuation (Llama 3.2-3B — sequential, after Whisper)
+                polished, _llm_sec = polish_text(processed)
+                if polished != processed:
+                    logger.info("llm  -> %s (%.2fs)", polished, _llm_sec)
+                    processed = polished
 
                 t_post = time.monotonic()
                 logger.info("raw -> %s", raw_text)
@@ -803,12 +719,12 @@ class AppDelegate(NSObject):
                 rss_mb_now = get_rss_mb()
                 kw_terms = len([x for x in self.keywords.split(",") if x.strip()]) if self.keywords else 0
                 logger.info(
-                    "[BENCH] audio=%.1fs | asr=%.2fs | llm=%.2fs | rtf=%.2f | "
+                    "[BENCH] audio=%.1fs | asr=%.2fs | rtf=%.2f | "
                     "post=%.2fs | paste=%.2fs | total=%.2fs | rss=%.0fMB | "
-                    "kw_chars=%d | kw_terms=%d | prompt=%s | slow_streak=%d | streaming=yes",
-                    duration, asr_sec, llm_sec, rtf, t_post - (t_start + asr_sec),
+                    "kw_chars=%d | kw_terms=%d | prompt=%s",
+                    duration, asr_sec, asr_sec / max(duration, 0.1), t_post - (t_start + asr_sec),
                     t_end - t_post, t_end - t_start, rss_mb_now, len(self.keywords),
-                    kw_terms, "on" if bool(self.keywords) else "off", self._slow_asr_streak,
+                    kw_terms, "on" if use_prompt else "off",
                 )
 
                 self.is_transcribing = False
@@ -821,10 +737,6 @@ class AppDelegate(NSObject):
             if self._asr_watchdog:
                 self._asr_watchdog.cancel()
                 self._asr_watchdog = None
-            self._streamer = None
-            self._clipboard_snapshot = None
-            self._clipboard_change_count = None
-            self.audio_chunks = []
             restarting = False
             now = time.time()
             if now - self._last_memory_maintenance_ts >= MEMORY_MAINTENANCE_INTERVAL_SEC:

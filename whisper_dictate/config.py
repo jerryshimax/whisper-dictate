@@ -16,9 +16,6 @@ LOG_FILE = os.path.expanduser("~/.config/whisper/app.log")
 
 # ── ASR models ─────────────────────────────────────────────
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-WHISPER_MODEL_FAST = "mlx-community/distil-whisper-large-v3"  # faster for short utterances
-# Utterances shorter than this use the fast model
-FAST_MODEL_DURATION_THRESHOLD_SEC = 5.0
 
 # ── audio ──────────────────────────────────────────────────
 SAMPLE_RATE = 16000
@@ -36,27 +33,13 @@ MEMORY_SOFT_LIMIT_MB = 2500
 MEMORY_MAINTENANCE_INTERVAL_SEC = 4 * 60 * 60  # 4 h (less aggressive cache clearing)
 FN_MIN_HOLD_SEC = 0.2
 TAP_MAX_HOLD_SEC = 0.6           # tap < 0.6s = toggle mode; hold >= 0.6s = hold-to-talk
-ASR_SLOW_THRESHOLD_SEC = 10.0
-ASR_SLOW_RTF_THRESHOLD = 1.8
 ASR_WATCHDOG_SEC = 30.0
 RECORDING_TIMEOUT_SEC = 120.0
-ASR_SLOW_STREAK_TRIGGER = 1
-PROMPT_DISABLE_ROUNDS_ON_SLOW = 6
 KEYWORDS_MAX_CHARS = 800  # ~200 words ≈ ~220 Whisper tokens (224 token limit)
 MIN_AUDIO_DURATION_SEC = 0.6
 TRAILING_SILENCE_WINDOW_SEC = 0.05
 TRAILING_SILENCE_HOLD_SEC = 0.28
 TRAILING_SILENCE_DB_THRESHOLD = -42.0
-
-# ── streaming VAD ─────────────────────────────────────────
-VAD_ENERGY_THRESHOLD_DB = -42.0     # dB above which we consider speech (lower = more sensitive)
-VAD_SILENCE_TRIGGER_SEC = 0.45      # silence duration to trigger segment boundary
-VAD_MIN_SEGMENT_SEC = 0.5           # minimum speech segment to transcribe
-VAD_FRAME_SEC = 0.03                # 30ms VAD frames
-VAD_MAX_SEGMENT_SEC = 3.0           # force segment boundary after this much continuous speech
-
-# ── LLM skip ─────────────────────────────────────────────
-LLM_SKIP_WORD_THRESHOLD = 8         # skip LLM polish for utterances <= this many words
 
 # ── context awareness ─────────────────────────────────────
 CONTEXT_APPS = {

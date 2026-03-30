@@ -1,33 +1,36 @@
-"""LLM-based punctuation and capitalization polisher using local MLX models."""
+"""LLM-based text polisher using Llama 3.2-3B via MLX (Wispr Flow style)."""
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 logger = logging.getLogger("whisper_dictate.llm_polish")
 
-# Small, fast model for punctuation fixing
-LLM_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
-LLM_TIMEOUT_SEC = 3.0
-LLM_MAX_TOKENS = 512
+LLM_MODEL = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+LLM_TIMEOUT_SEC = 8.0
+LLM_MAX_TOKENS = 1024
 
 _model_cache: dict = {"model": None, "tokenizer": None, "loaded": False, "loading": False}
-_lock = threading.Lock()
 
 SYSTEM_PROMPT = (
-    "You are a punctuation fixer for speech-to-text output. "
-    "Fix ONLY: punctuation, capitalization, and sentence boundaries. "
-    "NEVER change, replace, correct, add, or remove any words. "
-    "NEVER paraphrase or rephrase. Keep every word exactly as-is. "
-    "NEVER add quotes around the output. "
-    "Proper nouns to preserve exactly: Synergis, Nscale, UUL, Packsmith, Roboforce, Hankun, AFLF. "
-    "Output ONLY the corrected text."
+    "Clean up this dictated text. Output ONLY the cleaned text.\n"
+    "- Add punctuation: ，。？！\n"
+    "- Remove fillers: 嗯 呃 um uh 就是说 那个\n"
+    "- Fix repetitions and false starts\n"
+    "- NEVER translate between languages. If user said English words, keep them in English. If Chinese, keep Chinese.\n"
+    "- Fix capitalization: proper nouns capitalized (US Bank, GitHub), normal words lowercase\n"
+    "- Keep all meaningful words, technical terms, and proper nouns exactly as spoken\n"
+    "- Do NOT add explanations, comments, or labels\n"
+    "- Do NOT wrap in quotes"
 )
 
 
 def warmup_llm() -> None:
-    """Pre-load the LLM model in background. Call after Whisper warmup."""
+    """Pre-load the LLM model in background."""
     if _model_cache["loaded"] or _model_cache["loading"]:
         return
     _model_cache["loading"] = True
@@ -40,8 +43,7 @@ def warmup_llm() -> None:
             _model_cache["model"] = model
             _model_cache["tokenizer"] = tokenizer
             _model_cache["loaded"] = True
-            elapsed = time.monotonic() - t0
-            logger.info("LLM loaded: %s (%.1fs)", LLM_MODEL, elapsed)
+            logger.info("LLM loaded: %s (%.1fs)", LLM_MODEL, time.monotonic() - t0)
         except Exception:
             logger.warning("LLM warmup failed", exc_info=True)
         finally:
@@ -51,11 +53,7 @@ def warmup_llm() -> None:
 
 
 def polish_text(text: str) -> tuple[str, float]:
-    """Fix punctuation/capitalization using local LLM.
-
-    Returns (polished_text, llm_seconds).
-    If LLM is not loaded or times out, returns original text.
-    """
+    """Polish dictated text using local LLM. Returns (polished_text, seconds)."""
     if not _model_cache["loaded"]:
         return text, 0.0
 
@@ -63,7 +61,7 @@ def polish_text(text: str) -> tuple[str, float]:
         return text, 0.0
 
     t0 = time.monotonic()
-    result = [text]  # default to original
+    result = [text]
 
     def _run():
         try:
@@ -89,18 +87,14 @@ def polish_text(text: str) -> tuple[str, float]:
             )
 
             cleaned = response.strip().strip('"\'')
-            if not cleaned or len(cleaned) < len(text) * 0.5:
-                return  # LLM output too short, reject
-            if len(cleaned) > len(text) * 2.0:
-                return  # LLM added too much, reject
-            # Verify words weren't changed: compare actual words, not just count
-            import re
-            orig_words = re.findall(r'[a-zA-Z]+|[\u4e00-\u9fff]', text.lower())
-            new_words = re.findall(r'[a-zA-Z]+|[\u4e00-\u9fff]', cleaned.lower())
-            if orig_words == new_words:
-                result[0] = cleaned
-            else:
-                logger.debug("LLM changed words, rejecting: %r -> %r", orig_words[:5], new_words[:5])
+            # Basic sanity: not empty, not wildly different length
+            if not cleaned or len(cleaned) < len(text) * 0.3:
+                logger.debug("LLM output too short, rejecting")
+                return
+            if len(cleaned) > len(text) * 3.0:
+                logger.debug("LLM output too long, rejecting")
+                return
+            result[0] = cleaned
         except Exception:
             logger.debug("LLM polish failed", exc_info=True)
 
